@@ -131,6 +131,7 @@ Editor(또는 `supabase db push`)에서 직접 실행한다 — 자동으로 적
 6. `0006_source_type_and_tags.sql` — `expressions.tags`/`source_label` 추가, `source_type` 값 정리(school/tv5monde/daily/news/video/import 등)
 7. `0007_chatgpt_prompt_override.sql` — `user_settings.chatgpt_prompt_override` (설정에서 ChatGPT 프롬프트 수정용, 아직 설정 UI는 미구현)
 8. `0008_raw_notes.sql` — `raw_notes`(붙여넣은 원문 보존) + `expressions.raw_note_id`
+9. `0009_fix_client_id_conflict_targets.sql` — **중요 버그 수정**: `expressions`/`raw_notes`의 `client_id` 유니크 인덱스가 부분 인덱스(`WHERE client_id IS NOT NULL`)였는데, 앱의 모든 upsert는 조건 없는 `ON CONFLICT (user_id, client_id)`를 써서 Postgres가 매칭을 못 해 **모든 저장이 실패**하고 있었음. `client_id`를 NOT NULL로 만들고 일반 UNIQUE 제약으로 교체. 이 마이그레이션 전까지는 앱에서 저장한 어떤 표현도 실제로 Supabase에 반영되지 않았을 가능성이 높음
 
 ## Edge Function 배포
 
