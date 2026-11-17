@@ -1,6 +1,7 @@
 import { supabase } from '@/lib/supabase';
-import { offlineDB } from '@/lib/db';
+import { offlineDB, type PendingExpression } from '@/lib/db';
 import { normalizeFr } from '@/lib/normalizeFr';
+import { parsePasteText } from '@/lib/pasteParser';
 
 export interface AddExpressionInput {
   userId: string;
@@ -11,8 +12,19 @@ export interface AddExpressionInput {
 
 export interface AddExpressionResult {
   stored: 'online' | 'offline';
-  expressionId: string | null;
+  /** How many rows this input turned into (pasteParser may split one input into several). */
+  savedCount: number;
   possibleDuplicate: { id: string; expression_fr: string } | null;
+}
+
+// "수업"/"학교"/"école" (등) 이 출처 칸에 들어가면 source_type을 school로
+// 맞춰준다 -- 자유 텍스트 출처칸과 표현장 필터용 enum을 이어주는 용도.
+const SCHOOL_CONTEXT_KEYWORDS = ['수업', '학교', 'école', 'ecole', 'school', 'class'];
+
+export function inferSourceTypeFromContext(context: string | null | undefined, fallback: string): string {
+  if (!context) return fallback;
+  const lower = context.toLowerCase();
+  return SCHOOL_CONTEXT_KEYWORDS.some((kw) => lower.includes(kw.toLowerCase())) ? 'school' : fallback;
 }
 
 async function findPossibleDuplicate(userId: string, expressionFr: string) {
@@ -28,6 +40,30 @@ async function findPossibleDuplicate(userId: string, expressionFr: string) {
   return data ?? null;
 }
 
+interface RowToSave {
+  expressionFr: string;
+  meaningKo: string | null;
+  tags: string[];
+}
+
+/**
+ * Turns one textarea submission into 1+ rows: if the text contains the
+ * same bullet/dash-list shape pasteParser already understands (single line
+ * with a "fr — ko" split, or multiple lines), it gets split the same way
+ * the "붙여넣기 저장" screen would. Plain single-expression input (no
+ * separator found) still saves as exactly one row, unchanged.
+ */
+export function splitInputIntoRows(text: string): RowToSave[] {
+  const { rows } = parsePasteText(text);
+  const usable = rows.filter((r) => r.status !== 'needs_review');
+  if (usable.length === 0) {
+    // Nothing parsed (e.g. a bare Korean-only line) -- fall back to saving
+    // the raw text as-is rather than silently dropping it.
+    return [{ expressionFr: text.trim(), meaningKo: null, tags: [] }];
+  }
+  return usable.map((r) => ({ expressionFr: r.expressionFr, meaningKo: r.meaningKo || null, tags: r.tags }));
+}
+
 /**
  * Saves the raw expression text immediately (spec requirement: never make
  * the user wait for AI analysis). Falls back to an IndexedDB queue -- not an
@@ -35,24 +71,27 @@ async function findPossibleDuplicate(userId: string, expressionFr: string) {
  * so the user's input is never lost mid-class.
  */
 export async function addExpression(input: AddExpressionInput): Promise<AddExpressionResult> {
-  const clientId = crypto.randomUUID();
-  const createdAt = new Date().toISOString();
+  const rows = splitInputIntoRows(input.expressionFr);
+  const sourceType = inferSourceTypeFromContext(input.originalContext, input.sourceType);
 
   let possibleDuplicate: { id: string; expression_fr: string } | null = null;
-  if (navigator.onLine) {
+  if (navigator.onLine && rows.length === 1) {
     try {
-      possibleDuplicate = await findPossibleDuplicate(input.userId, input.expressionFr);
+      possibleDuplicate = await findPossibleDuplicate(input.userId, rows[0].expressionFr);
     } catch {
       // Duplicate check is best-effort only; never block saving on it.
     }
   }
 
-  const queueOffline = async (lastError: string | null) => {
+  const createdAt = new Date().toISOString();
+  const queueOffline = async (row: RowToSave, lastError: string | null) => {
     await offlineDB.pendingExpressions.put({
-      clientId,
+      clientId: crypto.randomUUID(),
       userId: input.userId,
-      expressionFr: input.expressionFr,
-      sourceType: input.sourceType,
+      expressionFr: row.expressionFr,
+      meaningKo: row.meaningKo,
+      tags: row.tags,
+      sourceType,
       originalContext: input.originalContext ?? null,
       createdAt,
       syncStatus: 'pending',
@@ -61,37 +100,45 @@ export async function addExpression(input: AddExpressionInput): Promise<AddExpre
   };
 
   if (!navigator.onLine) {
-    await queueOffline(null);
-    return { stored: 'offline', expressionId: null, possibleDuplicate };
+    for (const row of rows) await queueOffline(row, null);
+    return { stored: 'offline', savedCount: rows.length, possibleDuplicate };
   }
 
-  const { data, error } = await supabase
-    .from('expressions')
-    .upsert(
-      {
-        user_id: input.userId,
-        client_id: clientId,
-        expression_fr: input.expressionFr,
-        source_type: input.sourceType,
-        original_context: input.originalContext ?? null,
-      },
-      { onConflict: 'user_id,client_id' }
-    )
-    .select('id')
-    .single();
+  let onlineCount = 0;
+  for (const row of rows) {
+    const clientId = crypto.randomUUID();
+    const { data, error } = await supabase
+      .from('expressions')
+      .upsert(
+        {
+          user_id: input.userId,
+          client_id: clientId,
+          expression_fr: row.expressionFr,
+          meaning_ko: row.meaningKo,
+          tags: row.tags,
+          source_type: sourceType,
+          original_context: input.originalContext ?? null,
+        },
+        { onConflict: 'user_id,client_id' }
+      )
+      .select('id')
+      .single();
 
-  if (error || !data) {
-    await queueOffline(error?.message ?? 'unknown error');
-    return { stored: 'offline', expressionId: null, possibleDuplicate };
+    if (error || !data) {
+      await queueOffline(row, error?.message ?? 'unknown error');
+      continue;
+    }
+
+    onlineCount++;
+    await enqueueForReview(input.userId, data.id);
+    void supabase.functions.invoke('analyze-expression', { body: { expressionId: data.id } }).catch(() => {});
   }
 
-  await enqueueForReview(input.userId, data.id);
-
-  // Fire-and-forget: AI analysis must never block the save flow or a
-  // continuous-entry session in class mode.
-  void supabase.functions.invoke('analyze-expression', { body: { expressionId: data.id } }).catch(() => {});
-
-  return { stored: 'online', expressionId: data.id, possibleDuplicate };
+  return {
+    stored: onlineCount === rows.length ? 'online' : onlineCount === 0 ? 'offline' : 'online',
+    savedCount: rows.length,
+    possibleDuplicate,
+  };
 }
 
 /**
@@ -106,38 +153,94 @@ export async function enqueueForReview(userId: string, expressionId: string): Pr
     .upsert({ user_id: userId, expression_id: expressionId }, { onConflict: 'user_id,expression_id', ignoreDuplicates: true });
 }
 
-/** Flushes everything in the offline queue. Call on reconnect. */
+/**
+ * Some already-queued rows were saved before this screen understood the
+ * "fr — ko" shape (e.g. a whole "Je pense à lui. — 나는 그를 생각해." line
+ * saved as one expression). Before syncing, re-run pasteParser on every
+ * still-pending row and replace any that would now split into something
+ * different -- so old stuck rows get fixed up automatically instead of
+ * uploading the wrong data forever.
+ */
+async function repairPendingExpression(row: PendingExpression): Promise<PendingExpression[]> {
+  if (row.meaningKo !== undefined && row.meaningKo !== null) {
+    return [row]; // already has a meaning recorded -- not one of the old bad rows
+  }
+
+  const rows = splitInputIntoRows(row.expressionFr);
+  const isUnchanged = rows.length === 1 && rows[0].expressionFr === row.expressionFr && !rows[0].meaningKo;
+  if (isUnchanged) return [row];
+
+  await offlineDB.pendingExpressions.delete(row.clientId);
+  const replacements: PendingExpression[] = rows.map((r) => ({
+    clientId: crypto.randomUUID(),
+    userId: row.userId,
+    expressionFr: r.expressionFr,
+    meaningKo: r.meaningKo,
+    tags: r.tags,
+    sourceType: row.sourceType,
+    originalContext: row.originalContext,
+    createdAt: row.createdAt,
+    syncStatus: 'pending',
+    lastError: null,
+  }));
+  await offlineDB.pendingExpressions.bulkPut(replacements);
+  return replacements;
+}
+
+/**
+ * Flushes everything in the offline queue. Safe to call repeatedly (on
+ * mount, periodically, on reconnect) -- a row that fails is marked 'error'
+ * and left for the next pass, and never blocks the rows after it.
+ */
 export async function syncPendingExpressions(userId: string): Promise<void> {
   const pending = await offlineDB.pendingExpressions.where({ userId }).and((row) => row.syncStatus !== 'synced').toArray();
 
-  for (const row of pending) {
-    await offlineDB.pendingExpressions.update(row.clientId, { syncStatus: 'syncing' });
-
-    const { data, error } = await supabase
-      .from('expressions')
-      .upsert(
-        {
-          user_id: row.userId,
-          client_id: row.clientId,
-          expression_fr: row.expressionFr,
-          source_type: row.sourceType,
-          original_context: row.originalContext,
-        },
-        { onConflict: 'user_id,client_id' }
-      )
-      .select('id')
-      .single();
-
-    if (error || !data) {
-      await offlineDB.pendingExpressions.update(row.clientId, {
-        syncStatus: 'error',
-        lastError: error?.message ?? 'unknown error',
-      });
-      continue;
+  for (const original of pending) {
+    let rowsToSync: PendingExpression[];
+    try {
+      rowsToSync = await repairPendingExpression(original);
+    } catch {
+      rowsToSync = [original];
     }
 
-    await offlineDB.pendingExpressions.update(row.clientId, { syncStatus: 'synced', lastError: null });
-    await enqueueForReview(row.userId, data.id);
-    void supabase.functions.invoke('analyze-expression', { body: { expressionId: data.id } }).catch(() => {});
+    for (const row of rowsToSync) {
+      try {
+        await offlineDB.pendingExpressions.update(row.clientId, { syncStatus: 'syncing' });
+
+        const { data, error } = await supabase
+          .from('expressions')
+          .upsert(
+            {
+              user_id: row.userId,
+              client_id: row.clientId,
+              expression_fr: row.expressionFr,
+              meaning_ko: row.meaningKo ?? null,
+              tags: row.tags ?? [],
+              source_type: row.sourceType,
+              original_context: row.originalContext,
+            },
+            { onConflict: 'user_id,client_id' }
+          )
+          .select('id')
+          .single();
+
+        if (error || !data) {
+          await offlineDB.pendingExpressions.update(row.clientId, {
+            syncStatus: 'error',
+            lastError: error?.message ?? 'unknown error',
+          });
+          continue;
+        }
+
+        await offlineDB.pendingExpressions.update(row.clientId, { syncStatus: 'synced', lastError: null });
+        await enqueueForReview(row.userId, data.id);
+        void supabase.functions.invoke('analyze-expression', { body: { expressionId: data.id } }).catch(() => {});
+      } catch (err) {
+        await offlineDB.pendingExpressions.update(row.clientId, {
+          syncStatus: 'error',
+          lastError: err instanceof Error ? err.message : 'unknown error',
+        });
+      }
+    }
   }
 }

@@ -3,9 +3,10 @@ import { QuickAddForm } from '@/features/capture/QuickAddForm';
 interface QuickAddSheetProps {
   open: boolean;
   onClose: () => void;
+  onSaved?: () => void;
 }
 
-export function QuickAddSheet({ open, onClose }: QuickAddSheetProps) {
+export function QuickAddSheet({ open, onClose, onSaved }: QuickAddSheetProps) {
   if (!open) return null;
 
   return (
@@ -20,7 +21,7 @@ export function QuickAddSheet({ open, onClose }: QuickAddSheetProps) {
             &times;
           </button>
         </div>
-        <QuickAddForm sourceType="manual" onSaved={() => undefined} />
+        <QuickAddForm sourceType="manual" onSaved={onSaved} />
       </div>
     </div>
   );

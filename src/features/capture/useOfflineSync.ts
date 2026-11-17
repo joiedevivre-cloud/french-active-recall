@@ -3,7 +3,17 @@ import { useAuth } from '@/contexts/AuthContext';
 import { pendingSyncCount } from '@/lib/db';
 import { syncPendingExpressions } from '@/features/capture/addExpression';
 
-/** Drives the "오프라인 저장 대기중" badge and auto-syncs on reconnect. */
+/**
+ * Drives the "동기화 대기" badge and syncs the offline queue.
+ *
+ * IMPORTANT: this used to sync ONLY on the browser's `online` event (the
+ * transition from offline to online). If the device was already online
+ * when a save silently failed (a real network blip, an RLS/schema error,
+ * anything), that event never fires again and the item would be stuck in
+ * the queue forever. Syncing on mount and on an interval as well closes
+ * that gap -- every queued item gets retried periodically regardless of
+ * whether a real offline/online transition ever happens.
+ */
 export function useOfflineSync() {
   const { user } = useAuth();
   const [pendingCount, setPendingCount] = useState(0);
@@ -14,20 +24,24 @@ export function useOfflineSync() {
     setPendingCount(await pendingSyncCount(user.id));
   };
 
+  const trySync = async () => {
+    if (!user || !navigator.onLine) return;
+    await syncPendingExpressions(user.id);
+    await refreshPendingCount();
+  };
+
   useEffect(() => {
     void refreshPendingCount();
-    const interval = setInterval(refreshPendingCount, 15_000);
+    void trySync();
+    const interval = setInterval(() => void trySync(), 30_000);
     return () => clearInterval(interval);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user?.id]);
 
   useEffect(() => {
-    async function handleOnline() {
+    function handleOnline() {
       setIsOnline(true);
-      if (user) {
-        await syncPendingExpressions(user.id);
-        await refreshPendingCount();
-      }
+      void trySync();
     }
     function handleOffline() {
       setIsOnline(false);
@@ -42,5 +56,5 @@ export function useOfflineSync() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user?.id]);
 
-  return { pendingCount, isOnline };
+  return { pendingCount, isOnline, retrySync: trySync };
 }

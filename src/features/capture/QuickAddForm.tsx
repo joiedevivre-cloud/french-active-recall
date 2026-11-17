@@ -3,16 +3,13 @@ import { useNavigate } from 'react-router-dom';
 import { useAuth } from '@/contexts/AuthContext';
 import { addExpression } from '@/features/capture/addExpression';
 
-interface SavedItem {
-  id: string;
-  text: string;
-}
-
 interface QuickAddFormProps {
   sourceType: string;
   /** Class mode hides toasts/checkmarks sound and keeps the UI minimal. */
   silent?: boolean;
-  onSaved?: (item: SavedItem) => void;
+  /** Called after every save attempt (online or queued offline) so the
+   * parent can refresh its "오늘 저장한 표현" list. */
+  onSaved?: () => void;
 }
 
 export function QuickAddForm({ sourceType, silent, onSaved }: QuickAddFormProps) {
@@ -22,8 +19,7 @@ export function QuickAddForm({ sourceType, silent, onSaved }: QuickAddFormProps)
   const [context, setContext] = useState('');
   const [saving, setSaving] = useState(false);
   const [duplicateWarning, setDuplicateWarning] = useState<string | null>(null);
-  const [savedFlash, setSavedFlash] = useState(false);
-  const [sessionItems, setSessionItems] = useState<SavedItem[]>([]);
+  const [savedFlash, setSavedFlash] = useState<string | null>(null);
 
   async function handleSave(andPractice: boolean) {
     if (!user || !text.trim() || saving) return;
@@ -41,17 +37,20 @@ export function QuickAddForm({ sourceType, silent, onSaved }: QuickAddFormProps)
       setDuplicateWarning(`이미 저장된 표현일 수 있어요: "${result.possibleDuplicate.expression_fr}"`);
     }
 
-    const savedItem: SavedItem = { id: result.expressionId ?? crypto.randomUUID(), text: text.trim() };
-    setSessionItems((prev) => [savedItem, ...prev]);
-    onSaved?.(savedItem);
-
+    onSaved?.();
     setText('');
     setContext('');
     setSaving(false);
 
     if (!silent) {
-      setSavedFlash(true);
-      setTimeout(() => setSavedFlash(false), 900);
+      setSavedFlash(
+        result.stored === 'offline'
+          ? `${result.savedCount}개 오프라인 저장 대기중`
+          : result.savedCount > 1
+            ? `${result.savedCount}개 저장됨 ✓`
+            : '저장됨 ✓'
+      );
+      setTimeout(() => setSavedFlash(null), 1500);
     }
 
     if (andPractice) {
@@ -71,7 +70,7 @@ export function QuickAddForm({ sourceType, silent, onSaved }: QuickAddFormProps)
           autoFocus
           value={text}
           onChange={(e) => setText(e.target.value)}
-          placeholder="들은 프랑스어 표현을 입력하세요 (예: relever un defi)"
+          placeholder="들은 프랑스어 표현을 입력하세요 (예: relever un défi, 또는 여러 줄로 'fr — 뜻')"
           rows={3}
           className="w-full rounded-2xl border border-slate-300 bg-white p-4 text-lg dark:border-slate-700 dark:bg-slate-900"
         />
@@ -117,20 +116,7 @@ export function QuickAddForm({ sourceType, silent, onSaved }: QuickAddFormProps)
         </div>
       </form>
 
-      {savedFlash && <div className="text-center text-sm text-green-600">저장됨 ✓</div>}
-
-      {sessionItems.length > 0 && (
-        <div>
-          <p className="mb-1 text-xs font-medium text-slate-500">오늘 저장한 표현 ({sessionItems.length})</p>
-          <ul className="flex flex-col gap-1">
-            {sessionItems.map((item) => (
-              <li key={item.id} className="rounded-lg bg-slate-100 px-3 py-2 text-sm dark:bg-slate-800">
-                {item.text}
-              </li>
-            ))}
-          </ul>
-        </div>
-      )}
+      {savedFlash && <div className="text-center text-sm text-green-600">{savedFlash}</div>}
     </div>
   );
 }

@@ -1,7 +1,8 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { supabase } from '@/lib/supabase';
 import { useAuth } from '@/contexts/AuthContext';
+import { allPendingExpressions, type PendingExpression } from '@/lib/db';
 
 type QuickFilter = 'all' | 'today' | 'week' | 'favorite';
 
@@ -37,6 +38,12 @@ export default function LibraryPage() {
   const [search, setSearch] = useState('');
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editMeaning, setEditMeaning] = useState('');
+  const [pending, setPending] = useState<PendingExpression[]>([]);
+
+  useEffect(() => {
+    if (!user) return;
+    void allPendingExpressions(user.id).then(setPending);
+  }, [user]);
 
   const { data: expressions = [], isLoading } = useQuery({
     queryKey: ['expressions', user?.id, quickFilter, search],
@@ -127,8 +134,26 @@ export default function LibraryPage() {
       </div>
 
       {isLoading && <p className="text-sm text-slate-400">불러오는 중...</p>}
-      {!isLoading && expressions.length === 0 && (
+      {!isLoading && expressions.length === 0 && pending.length === 0 && (
         <p className="text-sm text-slate-400">저장된 표현이 없습니다.</p>
+      )}
+
+      {quickFilter === 'all' && !search.trim() && pending.length > 0 && (
+        <ul className="flex flex-col gap-2">
+          {pending.map((row) => (
+            <li key={row.clientId} className="rounded-2xl border border-amber-300 p-4 dark:border-amber-700">
+              <div className="flex items-start justify-between gap-2">
+                <div>
+                  <p className="text-base font-medium">{row.expressionFr}</p>
+                  <p className="mt-0.5 text-sm text-slate-500">{row.meaningKo || '뜻 없음'}</p>
+                </div>
+                <span className="whitespace-nowrap rounded-full bg-amber-100 px-2 py-0.5 text-xs text-amber-700 dark:bg-amber-950 dark:text-amber-300">
+                  동기화 대기
+                </span>
+              </div>
+            </li>
+          ))}
+        </ul>
       )}
 
       <ul className="flex flex-col gap-2">

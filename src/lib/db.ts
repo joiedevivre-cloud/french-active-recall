@@ -9,6 +9,8 @@ export interface PendingExpression {
   clientId: string;
   userId: string;
   expressionFr: string;
+  meaningKo?: string | null;
+  tags?: string[];
   sourceType: string;
   originalContext: string | null;
   createdAt: string; // ISO timestamp, set at capture time (not at sync time)
@@ -73,4 +75,23 @@ export async function pendingPasteSyncCount(userId: string): Promise<number> {
     .where({ userId })
     .filter((row) => row.syncStatus !== 'synced')
     .count();
+}
+
+/** All not-yet-synced single-expression saves, newest first. Used by the
+ * sync status screen and by views that need to show "아직 서버에 없지만
+ * 이미 저장된" items (Home/수업 모드/표현장). */
+export async function allPendingExpressions(userId: string): Promise<PendingExpression[]> {
+  const rows = await offlineDB.pendingExpressions
+    .where({ userId })
+    .filter((row) => row.syncStatus !== 'synced')
+    .toArray();
+  return rows.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+}
+
+export async function allPendingPasteBatches(userId: string): Promise<PendingPasteBatch[]> {
+  const rows = await offlineDB.pendingPasteBatches
+    .where({ userId })
+    .filter((row) => row.syncStatus !== 'synced')
+    .toArray();
+  return rows.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 }
