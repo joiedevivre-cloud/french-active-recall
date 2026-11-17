@@ -15,7 +15,7 @@ export default function ClassMode() {
         </span>
       </div>
 
-      <QuickAddForm sourceType="class" silent />
+      <QuickAddForm sourceType="school" silent />
 
       <button
         onClick={() => navigate('/review?scope=today')}

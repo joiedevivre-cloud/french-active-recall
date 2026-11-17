@@ -84,6 +84,39 @@ HashRouter 대신 이 방식을 선택한 이유: Supabase Google OAuth는 PKCE
 작업(pg_cron 또는 예약된 Edge Function)은 아직 구현하지 않았다** — AI
 대화 기능 자체가 Phase 3 범위이기 때문. 구현 시 반드시 함께 추가할 것.
 
+## 붙여넣기 저장 ("Paste and save" quick import)
+
+홈 화면의 **[붙여넣기 저장]** → `/paste-save`. ChatGPT가 자유 형식(글머리
+기호, `—`/`–`/`|`/`→`/`=`/`:`/탭 구분자, 마크다운 표 등)으로 정리해 준
+표현을 그대로 붙여넣고 **[저장]** 한 번으로 바로 Supabase에 들어간다 —
+미리보기/확인 단계 없음. 파싱은 전부 `src/lib/pasteParser.ts`에서 AI 없이
+코드로 처리한다(테스트: `src/lib/pasteParser.test.ts`, 39개 모두 통과).
+
+- 중복은 `src/lib/csvImport.ts`의 `normalizeForDedup`(소문자, 악센트는
+  **유지**, 커리/스트레이트 아포스트로피만 통일, NFC)로 판단하고, 이미
+  있는 표현과 같은 배치 안의 반복 모두 걸러낸다.
+- 해석 못한 줄은 저장하지 않고 "확인 필요" 목록에 원문 그대로 남는다.
+- 붙여넣은 원문 전체는 `raw_notes`에 먼저 보존되고, 오프라인이면
+  `pendingPasteBatches`(IndexedDB)에 배치 전체를 저장했다가 온라인 복귀
+  시 통째로 동기화한다(원문 → 표현 순서 보장, `client_id` 기반 멱등).
+- 저장되는 `meaning_ko`/`expression_fr`은 사용자가 붙여넣은 그대로이며
+  AI가 생성한 값이 아니다 (`ai_analysis_status`는 `pending`으로 남아
+  있어 이후 분석과 구분됨).
+
+**아직 구현하지 않은 보조 기능** (요청에서 "위 기능이 완성된 뒤"로 명시된 부분):
+- "확인 필요" 줄을 Edge Function으로 AI 정리하는 `[AI로 정리]` 버튼
+- `meaning_ko`가 빈 표현을 백그라운드 AI로 채우는 자동화 (현재는 수동으로
+  표현장에서 수정하거나, 추후 이 자동화가 추가될 때까지 비어 있는 채로 둠)
+
+**별개로 주의할 점:** `src/content/chatgpt-prompt.md`에 넣은 ChatGPT
+프롬프트는 **CSV 표 형식**(````csv` 블록, `프랑스어,한국어 뜻,분류,출처`
+헤더)을 출력하도록 되어 있는데, 이는 `src/lib/csvImport.ts` 기반의 "CSV
+미리보기 가져오기" 플로우(요청상 더 먼저 설계됐지만 이번엔 화면까지는
+만들지 않음)용이다. 지금 만든 `/paste-save` 화면은 그 CSV를 파싱하지
+않는다 — 자유 형식 글머리 목록을 붙여넣는 용도다. 두 플로우를 다 쓰려면
+나중에 "프롬프트 복사" 버튼과 CSV 미리보기 화면을 별도로 이어서 만들어야
+한다.
+
 ## 데이터베이스 마이그레이션
 
 `supabase/migrations/`에 번호 순서로 들어있다. **검토 후 Supabase SQL
@@ -95,6 +128,9 @@ Editor(또는 `supabase db push`)에서 직접 실행한다 — 자동으로 적
 3. `0003_rls_policies.sql` — 모든 테이블 RLS
 4. `0004_new_user_provisioning.sql` — 신규 유저(Google 로그인 첫 성공 포함) 기본 행 자동 생성 트리거
 5. `0005_ai_usage_functions.sql` — 과금 카운터 원자적 증가 함수 (Edge Function 전용, 클라이언트 호출 불가)
+6. `0006_source_type_and_tags.sql` — `expressions.tags`/`source_label` 추가, `source_type` 값 정리(school/tv5monde/daily/news/video/import 등)
+7. `0007_chatgpt_prompt_override.sql` — `user_settings.chatgpt_prompt_override` (설정에서 ChatGPT 프롬프트 수정용, 아직 설정 UI는 미구현)
+8. `0008_raw_notes.sql` — `raw_notes`(붙여넣은 원문 보존) + `expressions.raw_note_id`
 
 ## Edge Function 배포
 
@@ -109,7 +145,7 @@ Switch)를 통과하기 전에는 실제 OpenAI 키를 연결하지 않는다.**
 
 ## 사용자가 직접 해야 하는 설정 (Claude Code가 대신 할 수 없는 작업)
 
-1. **Supabase 마이그레이션 적용**: 위 5개 SQL을 순서대로 SQL Editor에서 실행
+1. **Supabase 마이그레이션 적용**: 위 8개 SQL을 순서대로 SQL Editor에서 실행 (0006~0008은 새로 추가됨, 아직 미실행이면 검토 후 적용)
 2. **Google OAuth**:
    - Google Cloud Console에서 OAuth 클라이언트 생성, 승인된 리디렉션 URI에
      `https://xwbcpanispdyrchddnzi.supabase.co/auth/v1/callback` 등록
@@ -128,16 +164,30 @@ Switch)를 통과하기 전에는 실제 OpenAI 키를 연결하지 않는다.**
 
 ## 테스트 결과
 
-### 자동화
+### 자동화 (이번 세션에서 실행, 통과 확인)
 
-- `npm run typecheck` — 로컬에서 실행 확인 필요 (아래 "미검증" 참고)
-- `npm test` (`vitest`) — `normalizeFr` 유닛 테스트만 존재. 핵심 플로우(저장/복습/인증)에 대한 자동화 테스트는 아직 없음
+- `npm run typecheck` — 통과
+- `npm run build` — 통과 (더미 env로 로컬 빌드, 번들에 비밀키 누출 없음 확인)
+- `npm test` (`vitest`) — **39개 테스트 통과**
+  - `normalizeFr.test.ts` (3개)
+  - `pasteParser.test.ts` (36개): 유저 예시 3줄 분리, 글머리 기호 9종,
+    원형 숫자, 마크다운 굵게/코드/표, 구분자 8종, `peut-être`/`Qu'est-ce
+    que`/`Est-ce que` 보존, 프랑스어만 있는 줄, 제목→tags, 한글만 있는
+    줄→확인 필요, 설명 문장 무시, 빈 줄 무시, 중복(정확 일치/악센트
+    다름/아포스트로피 통일/배치 내 반복/재붙여넣기) 전부 포함
+- `src/lib/csvImport.ts`용 자동 테스트는 **아직 작성 안 함** (이번 우선순위
+  변경으로 `/paste-save`에 집중했고, CSV 미리보기 플로우는 화면까지
+  만들지 않아 보류)
 
 ### 수동 (사용자 환경에서만 가능 — 미검증)
 
-다음은 실제 Supabase 프로젝트 연결, Google OAuth 설정, GitHub Pages 배포가
-끝나야 검증 가능하여 **이번 세션에서는 미검증**으로 남긴다:
+다음은 실제 Supabase 연결·배포 후에만 확인 가능해 **이번 세션에서는
+미검증**으로 남긴다:
 
+- 휴대폰에서 유저 예시(`Je pense à lui. — ...` 3줄)를 `/paste-save`에
+  붙여넣고 저장 → Supabase `expressions`/`review_states`/`raw_notes`에
+  3행 반영 → 표현장과 오늘 복습에 표시
+- 오프라인 저장 → 온라인 복귀 시 `pendingPasteBatches` 자동 동기화
 - 모바일에서 표현 저장 → Supabase 반영 → 새로고침 후 유지
 - Google 로그인 후 원래 화면으로 복귀
 - RLS: 다른 사용자 데이터 접근 차단

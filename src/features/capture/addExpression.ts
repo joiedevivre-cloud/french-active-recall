@@ -100,7 +100,7 @@ export async function addExpression(input: AddExpressionInput): Promise<AddExpre
  * Idempotent via the review_states (user_id, expression_id) unique
  * constraint, so re-syncing an already-queued expression is a no-op.
  */
-async function enqueueForReview(userId: string, expressionId: string): Promise<void> {
+export async function enqueueForReview(userId: string, expressionId: string): Promise<void> {
   await supabase
     .from('review_states')
     .upsert({ user_id: userId, expression_id: expressionId }, { onConflict: 'user_id,expression_id', ignoreDuplicates: true });

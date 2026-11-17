@@ -59,6 +59,13 @@ export default function HomePage() {
         + 표현 추가
       </button>
 
+      <Link
+        to="/paste-save"
+        className="flex items-center justify-center rounded-2xl border border-blue-600 py-3 text-base font-semibold text-blue-600 dark:text-blue-400"
+      >
+        붙여넣기 저장
+      </Link>
+
       <div className="grid grid-cols-2 gap-3">
         <Link to="/class-mode" className="rounded-2xl border border-slate-200 p-4 text-center dark:border-slate-800">
           <div className="text-2xl">🎓</div>
