@@ -3,6 +3,7 @@ import {
   SEED_MAX_CANDIDATES,
   grammarTermsFor,
   looseKey,
+  patternHasLemma,
   mergeExamples,
   prepareSeedSenses,
   sanitizeSense,
@@ -123,6 +124,19 @@ describe('prepareSeedSenses (code rules behind the AI self-check)', () => {
   it('a usage without examples is rejected; a missing verdict fails closed', () => {
     expect(prepareSeedSenses([{ ...sense('x', 'faire qqch'), examples: [] }], null, []).accepted).toHaveLength(0);
     expect(prepareSeedSenses([sense('x', 'faire qqch')], [], []).accepted).toHaveLength(0);
+  });
+});
+
+describe('patternHasLemma (another word construction never leaks in)', () => {
+  it('rejects a pattern without the lemma, keeps pronominal and accented forms', () => {
+    expect(patternHasLemma('tenir à qqn/qqch', 'penser')).toBe(false);
+    expect(patternHasLemma('penser de qqch', 'penser')).toBe(true);
+    expect(patternHasLemma('se confier à qqn', 'confier')).toBe(true);
+    expect(patternHasLemma("s'occuper de qqn", 'occuper')).toBe(true);
+    expect(patternHasLemma('préférer + inf.', 'preferer')).toBe(true);
+    const { accepted, rejected } = prepareSeedSenses([sense('아끼다', 'tenir à qqn/qqch')], null, [], { lemma: 'penser' });
+    expect(accepted).toHaveLength(0);
+    expect(rejected[0].reason_ko).toMatch(/다른 단어/);
   });
 });
 

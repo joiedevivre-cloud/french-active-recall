@@ -263,7 +263,7 @@ async function handleSeedDictionary(admin: ReturnType<typeof createClient>, user
     if (pairs.length === 0) return jsonResponse({ error: 'no_senses' }, 400);
     const existing = await loadExisting();
     // mergeInto is honoured only when it is a similar (qqn/qqch) usage of THIS lemma -- checked inside prepareSeedSenses
-    const { accepted, rejected } = prepareSeedSenses(pairs.map((p) => p.sense), null, existing, { chosenMerges: pairs.map((p) => p.mergeInto) });
+    const { accepted, rejected } = prepareSeedSenses(pairs.map((p) => p.sense), null, existing, { chosenMerges: pairs.map((p) => p.mergeInto), lemma: lemma.lemma });
 
     const { count: existingCount } = await admin.from('lemma_usages').select('id', { count: 'exact', head: true }).eq('lemma_id', lemmaId);
     let sortOrder = existingCount ?? 0;
@@ -388,7 +388,7 @@ async function handleSeedDictionary(admin: ReturnType<typeof createClient>, user
       return jsonResponse({ error: 'verification_failed', message: '검증 단계가 실패해서 아무것도 추가하지 않았어요.' }, 502);
     }
 
-    const { accepted, rejected } = prepareSeedSenses([...generated, ...missing], verdicts, await loadExisting(), { missingFromIndex: generated.length });
+    const { accepted, rejected } = prepareSeedSenses([...generated, ...missing], verdicts, await loadExisting(), { missingFromIndex: generated.length, lemma: lemma.lemma });
     await admin.rpc('increment_ai_usage', { p_user_id: userId, p_cost_usd: totalCost, p_expression_analyses: 1 });
     return jsonResponse({ ok: true, senses: accepted, rejected, models: { generate: model, verify: SEED_VERIFY_MODEL } });
   } finally {

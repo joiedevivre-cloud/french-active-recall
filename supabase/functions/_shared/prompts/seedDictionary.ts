@@ -56,9 +56,11 @@ qqn = a person, qqch = a thing, qqn/qqch = either, inf. = an infinitive, proposi
 Examples: "confier qqch à qqn", "se confier à qqn", "se mettre à + inf.", "tenir à qqn/qqch", "sembler que + proposition".
 Never write "nom (사람)", "groupe nominal (personne)" or similar.`;
 
+const CONSTRUCTION_CHECKLIST = `(a) + qqch / qqn directly (complément d'objet direct)  (b) à + qqn/qqch  (c) à + inf.  (d) de + qqn/qqch  (e) de + inf.  (f) que + proposition (which mood?)  (g) + inf. with NO preposition  (h) other prepositions (en, pour, sur, avec, par, dans, chez...)  (i) pronominal form (se ...)  (j) fixed expressions with this lemma that learners meet often`;
+
 const USAGE_FIELDS = `Each usage:
-- label: short Korean label.
-- meaning_ko: short Korean meaning.
+- label: short Korean label of THIS construction's meaning (not another construction's -- e.g. a "+ inf." usage and an "à + inf." usage usually mean different things; never copy one label to the other).
+- meaning_ko: short Korean meaning of THIS construction.
 - pattern: the construction, in the notation above.
 - tier: "core" = frequent in everyday French and needed at A2~B2; "extra" = real and useful but less frequent.
 - required_complement: "nom" | "pronom" | "infinitif" | "clause" | "independent".
@@ -72,7 +74,9 @@ const USAGE_FIELDS = `Each usage:
 export const SEED_GENERATE_SYSTEM_PROMPT = `You are a French lexicographer building a personal vocabulary entry for a Korean-speaking learner (A2~B2, Montreal). Given ONE French lemma (dictionary form), survey ALL of its main grammatical constructions and list them, most frequent first.
 
 A usage = one distinct CONSTRUCTION. Rules:
-1. Survey first: transitive / intransitive, every preposition the verb takes (à, de, en, pour, sur...), + inf., que + proposition, pronominal form. When the preposition or complement changes the meaning, it is a SEPARATE usage -- but only when meaning and use really differ. Illustration with "tenir" (another verb, for the method only): tenir qqch (잡다), tenir à qqn/qqch (아끼다), tenir à + inf. (꼭 ~하고 싶다), tenir de qqn (닮다), se tenir (자세를 유지하다).
+1. Survey first. Go through this checklist for THIS lemma only and keep each slot the lemma really uses:
+   ${CONSTRUCTION_CHECKLIST}
+   When the preposition or complement changes the meaning, it is a SEPARATE usage -- but only when meaning and use really differ. Every pattern must contain this lemma itself (never another word's construction).
 2. Never list the same construction twice. A variation inside the same construction (e.g. "confier un secret à qqn" is "confier qqch à qqn" with qqch = un secret) is NOT a new usage -- make it an extra example and widen the Korean label if needed ("맡기다 / (비밀을) 털어놓다").
 3. Only constructions native speakers really use. Never translate an English construction word for word ("entrust A with B" -> "confier qqn avec qqch" is NOT French). If unsure, leave it out.
 4. Do not split by Korean translation: one construction with several Korean equivalents is ONE usage.
@@ -145,8 +149,11 @@ Task 1 -- for EACH usage (by index):
 - "fix": real construction but something is wrong -- pattern notation, Korean label/meaning, tier, an unnatural or ungrammatical example, or a Korean translation that does not match the French exactly (e.g. "ma voiture" translated as "그의 차"). Return corrected values.
 - "keep": everything is correct (repeat the input values).
 Check every example word by word: grammar, agreement (including past-participle agreement), prepositions, and that it really uses THIS construction. Remove examples you cannot fix.
+Check the Korean label, meaning and every Korean translation against the construction itself: if a label or translation describes what ANOTHER construction of this lemma means, that is a "fix".
 
-Task 2 -- "missing": list the important constructions of this lemma that the entry does not cover, especially ones where a different preposition / complement changes the meaning (à vs de vs que vs + inf.). Same construction as an existing usage is NOT missing. Return [] if nothing important is missing. Same fields as a usage.
+Task 2 -- "missing": go through this checklist slot by slot for this lemma:
+${CONSTRUCTION_CHECKLIST}
+For every slot the lemma really uses (common in everyday French) that no usage covers, add it to "missing". A construction with a different preposition / complement and a different meaning counts as missing even when another usage looks similar (e.g. "X + inf." vs "X à + inf."). Same construction as an existing usage is NOT missing. Every pattern must contain this lemma. Return [] only if every used slot is covered. Same fields as a usage.
 
 ${NOTATION_RULES}
 
@@ -305,11 +312,24 @@ export function sanitizeSense(raw: unknown): SeedSense | null {
  *  - core first, then extra; SEED_MAX_CANDIDATES safety cap (cut ones listed)
  * `missingFromIndex`: senses at or after this index were added by the self-check.
  */
+/**
+ * The pattern must contain the lemma itself ("penser de qqch" for penser).
+ * Blocks another word's construction leaking in (the generator once
+ * returned "tenir à qqn/qqch" for penser, copied from a prompt example).
+ */
+export function patternHasLemma(canonicalPattern: string, lemma: string): boolean {
+  const fold = (x: string) => x.normalize('NFD').replace(/[̀-ͯ]/g, '').normalize('NFC').toLowerCase();
+  const target = fold(lemma.trim());
+  if (!target) return true;
+  const tokens = fold(canonicalPattern).replace(/[’]/g, "'").split(' ');
+  return tokens.some((t) => t === target || t === `s'${target}` || t === `se ${target}`);
+}
+
 export function prepareSeedSenses(
   senses: SeedSense[],
   verdicts: SeedVerdict[] | null,
   existingUsages: { id: string; label: string; pattern: string | null }[],
-  options: { missingFromIndex?: number; chosenMerges?: (string | null)[] } = {}
+  options: { missingFromIndex?: number; chosenMerges?: (string | null)[]; lemma?: string } = {}
 ): { accepted: PreparedSense[]; rejected: RejectedSense[] } {
   const missingFrom = options.missingFromIndex ?? Number.POSITIVE_INFINITY;
   const chosenMerges = options.chosenMerges ?? [];
@@ -353,6 +373,10 @@ export function prepareSeedSenses(
     }
 
     const pattern = canonicalizePattern(sense.pattern);
+    if (options.lemma && !patternHasLemma(pattern, options.lemma)) {
+      rejected.push({ label: sense.label, pattern, reason_ko: `"${options.lemma}"가 들어 있지 않은 구문이라 제외했어요(다른 단어의 쓰임).` });
+      return;
+    }
     const calque = calqueReason(pattern);
     if (calque) {
       rejected.push({ label: sense.label, pattern, reason_ko: calque });
