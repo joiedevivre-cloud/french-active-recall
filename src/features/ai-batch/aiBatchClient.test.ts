@@ -2,11 +2,26 @@ import { describe, expect, it, vi, beforeEach } from 'vitest';
 import {
   chunkSentences,
   analyzeChunk,
+  analyzeChunkWithRetry,
   analyzeSentencesInChunks,
   failedSentencesFrom,
   CHUNK_SIZE,
   type BatchItemResult,
 } from '@/features/ai-batch/aiBatchClient';
+
+function truncatedResponse() {
+  return new Response(JSON.stringify({ error: 'output_truncated', message: 'output_truncated: finish_reason=length, length=900' }), {
+    status: 502,
+    headers: { 'content-type': 'application/json' },
+  });
+}
+
+function rateLimitedResponse() {
+  return new Response(JSON.stringify({ error: 'daily_limit_exceeded' }), {
+    status: 429,
+    headers: { 'content-type': 'application/json' },
+  });
+}
 
 const invokeMock = vi.fn();
 
@@ -180,5 +195,53 @@ describe('failedSentencesFrom', () => {
   it('returns an empty array when nothing failed', () => {
     const results = [{ sentences: ['a'], status: 'success' as const, results: [fakeResult('a')] }];
     expect(failedSentencesFrom(results)).toEqual([]);
+  });
+});
+
+describe('analyzeChunkWithRetry - output_truncated retry (the real production bug)', () => {
+  it('retries by splitting in half, and succeeds once the halves are small enough', async () => {
+    invokeMock.mockImplementation((_fn, opts) => {
+      const chunk = opts.body.sentences as string[];
+      // Simulate: the full chunk truncates, but each half fits.
+      if (chunk.length > 2) {
+        return Promise.resolve({ data: null, error: { message: 'non-2xx' }, response: truncatedResponse() });
+      }
+      return Promise.resolve({ data: { ok: true, results: chunk.map(fakeResult) }, error: null });
+    });
+
+    const results = await analyzeChunkWithRetry(['a', 'b', 'c', 'd']);
+    expect(results.every((r) => r.status === 'success')).toBe(true);
+    expect(results.flatMap((r) => r.results ?? []).map((r) => r.expression_fr)).toEqual(['a', 'b', 'c', 'd']);
+    // 1 failed full-chunk attempt + 2 successful half-chunk attempts.
+    expect(invokeMock).toHaveBeenCalledTimes(3);
+  });
+
+  it('gives up after MAX_SPLIT_RETRY_DEPTH and reports only what is still failing', async () => {
+    invokeMock.mockResolvedValue({ data: null, error: { message: 'non-2xx' }, response: truncatedResponse() });
+
+    const results = await analyzeChunkWithRetry(['a', 'b', 'c', 'd']);
+    expect(results.every((r) => r.status === 'failed')).toBe(true);
+    expect(results.flatMap((r) => r.sentences).sort()).toEqual(['a', 'b', 'c', 'd']);
+    // Never recurses forever: bounded by depth, not by sentence count.
+    expect(invokeMock.mock.calls.length).toBeLessThan(20);
+  });
+
+  it('never splits/retries a non-truncation failure (e.g. rate limit)', async () => {
+    invokeMock.mockResolvedValue({ data: null, error: { message: 'non-2xx' }, response: rateLimitedResponse() });
+
+    const results = await analyzeChunkWithRetry(['a', 'b', 'c', 'd']);
+    expect(results).toHaveLength(1);
+    expect(results[0].status).toBe('failed');
+    expect(results[0].sentences).toEqual(['a', 'b', 'c', 'd']);
+    expect(invokeMock).toHaveBeenCalledTimes(1); // no retry attempted at all
+  });
+
+  it('a single-sentence chunk cannot be split further even if truncated', async () => {
+    invokeMock.mockResolvedValue({ data: null, error: { message: 'non-2xx' }, response: truncatedResponse() });
+
+    const results = await analyzeChunkWithRetry(['a']);
+    expect(results).toHaveLength(1);
+    expect(results[0].status).toBe('failed');
+    expect(invokeMock).toHaveBeenCalledTimes(1);
   });
 });

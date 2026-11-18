@@ -1,6 +1,13 @@
 import { supabase } from '@/lib/supabase';
 
-export const CHUNK_SIZE = 15;
+// Lowered from 15: a real production failure ("Unterminated string in
+// JSON", i.e. OpenAI's response got cut off mid-generation) traced back to
+// analyze-batch requesting a fixed, too-small max_tokens regardless of
+// chunk size (fixed server-side too -- see supabase/functions/analyze-batch
+// computeMaxOutputTokens). A smaller chunk needs less output per request,
+// which keeps it comfortably under the server's token ceiling with margin.
+export const CHUNK_SIZE = 6;
+const MAX_SPLIT_RETRY_DEPTH = 2;
 
 export interface BatchItemResult {
   expression_fr: string;
@@ -85,6 +92,35 @@ async function describeInvokeError(response: Response | undefined): Promise<stri
 }
 
 /**
+ * Retries ONLY an `output_truncated` failure (the model's response got cut
+ * off mid-JSON) by splitting the chunk in half and trying each half
+ * independently -- a smaller chunk needs less output, so it's more likely
+ * to finish within budget. Bounded to MAX_SPLIT_RETRY_DEPTH splits so this
+ * can never loop forever. Every OTHER failure (401/403/429, network error,
+ * result-count mismatch, a truncation that still doesn't fit even at
+ * depth 1) is returned as-is with NO retry -- retrying an auth or rate
+ * limit error endlessly would never succeed and only wastes calls.
+ * Returns a flat list because a split can resolve to a mix of successful
+ * and still-failed sub-chunks.
+ */
+export async function analyzeChunkWithRetry(sentences: string[], depth = 0): Promise<AiBatchChunkResult[]> {
+  const result = await analyzeChunk(sentences);
+  if (result.status === 'success') return [result];
+
+  const isTruncation = result.error?.includes('output_truncated') ?? false;
+  if (!isTruncation || sentences.length <= 1 || depth >= MAX_SPLIT_RETRY_DEPTH) {
+    return [result];
+  }
+
+  const mid = Math.ceil(sentences.length / 2);
+  const [firstHalf, secondHalf] = await Promise.all([
+    analyzeChunkWithRetry(sentences.slice(0, mid), depth + 1),
+    analyzeChunkWithRetry(sentences.slice(mid), depth + 1),
+  ]);
+  return [...firstHalf, ...secondHalf];
+}
+
+/**
  * Analyzes every sentence by splitting into CHUNK_SIZE-sized chunks and
  * calling analyze-batch sequentially (so the per-user concurrency-1 lock
  * never fights itself, and progress can be reported after each chunk).
@@ -99,8 +135,8 @@ export async function analyzeSentencesInChunks(
   let done = 0;
 
   for (const chunk of chunks) {
-    const result = await analyzeChunk(chunk);
-    chunkResults.push(result);
+    const results = await analyzeChunkWithRetry(chunk);
+    chunkResults.push(...results);
     done += chunk.length;
     onProgress?.(done, sentences.length);
   }

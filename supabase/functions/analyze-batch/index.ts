@@ -23,6 +23,24 @@ const OPENAI_API_KEY = Deno.env.get('OPENAI_API_KEY');
 
 const MAX_CHUNK_SIZE = 20;
 
+// Each result item carries ~9 fields of Korean/French text. A FIXED
+// max_tokens regardless of chunk size (the old bug: always 1024,
+// whatever ai_rate_limits.max_output_tokens said) meant any chunk bigger
+// than ~3-4 sentences could never finish within budget -- OpenAI stops
+// generating mid-string (finish_reason: 'length') and the truncated text
+// is simply not valid JSON. This is a generous-but-bounded per-item
+// estimate, not a tight one; MAX_TOTAL_OUTPUT_TOKENS is a hard ceiling
+// independent of whatever a user's ai_rate_limits row says, so a
+// misconfigured/very high row can never request an enormous completion.
+const TOKENS_PER_ITEM_ESTIMATE = 350;
+const OUTPUT_TOKEN_OVERHEAD = 200;
+const MAX_TOTAL_OUTPUT_TOKENS = 4000;
+
+function computeMaxOutputTokens(sentenceCount: number, configuredCeiling: number): number {
+  const estimated = sentenceCount * TOKENS_PER_ITEM_ESTIMATE + OUTPUT_TOKEN_OVERHEAD;
+  return Math.min(estimated, MAX_TOTAL_OUTPUT_TOKENS, configuredCeiling);
+}
+
 // Approximate OpenAI pricing (USD per 1M tokens). VERIFY against
 // https://openai.com/api/pricing -- this is only as accurate as the last
 // time someone updated it here.
@@ -189,7 +207,8 @@ Deno.serve(async (req) => {
     let inputTokens = 0;
     let outputTokens = 0;
     try {
-      const completion = await callOpenAI(sentences, model, limits.max_output_tokens);
+      const maxOutputTokens = computeMaxOutputTokens(sentences.length, limits.max_output_tokens);
+      const completion = await callOpenAI(sentences, model, maxOutputTokens);
       results = completion.results;
       inputTokens = completion.inputTokens;
       outputTokens = completion.outputTokens;
@@ -201,12 +220,18 @@ Deno.serve(async (req) => {
         throw new Error(`result_count_mismatch: expected ${sentences.length}, got ${results.length}`);
       }
     } catch (err) {
+      const message = String(err);
+      // Distinguish "output got cut off / wasn't valid JSON" from other
+      // OpenAI failures with its own error code, so the client
+      // (aiBatchClient.ts) can retry ONLY this case (by splitting the
+      // chunk smaller) and never retry e.g. a 401/403/429.
+      const isTruncation = message.includes('output_truncated');
       console.error('[analyze-batch] openai_call_failed', err instanceof Error ? err.stack ?? err.message : err);
       await admin
         .from('ai_usage_log')
-        .update({ status: 'failed', rejection_reason: String(err) })
+        .update({ status: 'failed', rejection_reason: message })
         .eq('id', usageLogId);
-      return jsonResponse({ error: 'openai_call_failed', message: String(err) }, 502);
+      return jsonResponse({ error: isTruncation ? 'output_truncated' : 'openai_call_failed', message }, 502);
     }
 
     const estimatedCost = (inputTokens / 1_000_000) * pricing.input + (outputTokens / 1_000_000) * pricing.output;
@@ -304,10 +329,32 @@ Return exactly ${sentences.length} result objects, one per input sentence, in in
   }
 
   const payload = await response.json();
-  const content = payload.choices?.[0]?.message?.content;
+  const choice = payload.choices?.[0];
+  const content = choice?.message?.content;
   if (!content) throw new Error('openai_empty_response');
 
-  const parsed = JSON.parse(content) as { results: BatchItemResult[] };
+  // This is the actual fix for the production "Unterminated string in
+  // JSON" error: when the model hits max_tokens mid-generation, OpenAI
+  // sets finish_reason: 'length' and `content` is a truncated, invalid
+  // JSON string. Checking this BEFORE JSON.parse turns that into a clear,
+  // specific error instead of a raw SyntaxError -- and gives the caller
+  // (src/features/ai-batch/aiBatchClient.ts) a code it can recognize to
+  // retry with a smaller chunk, rather than treating it like any other
+  // failure. Never log `content` itself (it's the user's pasted text).
+  if (choice?.finish_reason && choice.finish_reason !== 'stop') {
+    throw new Error(`output_truncated: finish_reason=${choice.finish_reason}, length=${content.length}`);
+  }
+
+  let parsed: { results: BatchItemResult[] };
+  try {
+    parsed = JSON.parse(content) as { results: BatchItemResult[] };
+  } catch {
+    // Belt-and-suspenders: even if finish_reason somehow read 'stop', a
+    // response that still isn't valid JSON gets the same "try a smaller
+    // chunk" treatment instead of crashing the whole request uncaught.
+    throw new Error(`output_truncated: invalid_json, length=${content.length}`);
+  }
+
   return {
     results: parsed.results ?? [],
     inputTokens: payload.usage?.prompt_tokens ?? 0,
