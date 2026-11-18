@@ -25,6 +25,14 @@ export interface PendingPasteRow {
   meaningKo: string;
   tags: string[];
   isSentence: boolean;
+  // Optional AI-batch-analysis fields (see src/features/ai-batch/). Left
+  // undefined for a plain "붙여넣기 저장" row with no AI involved.
+  correctedFr?: string | null;
+  keyPhrase?: string | null;
+  grammarNote?: string | null;
+  cefrLevel?: string | null;
+  exampleFr?: string | null;
+  exampleTranslationKo?: string | null;
 }
 
 /**

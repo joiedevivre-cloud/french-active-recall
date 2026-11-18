@@ -6,6 +6,7 @@ import HomePage from '@/features/home/HomePage';
 import ClassMode from '@/features/class-mode/ClassMode';
 import LibraryPage from '@/features/library/LibraryPage';
 import PasteSavePage from '@/features/paste-save/PasteSavePage';
+import AiBatchAddPage from '@/features/ai-batch/AiBatchAddPage';
 import SyncStatusPage from '@/features/sync-status/SyncStatusPage';
 import TodayReview from '@/features/review/TodayReview';
 import AiChatPlaceholder from '@/features/ai-chat/AiChatPlaceholder';
@@ -25,6 +26,7 @@ export function AppRoutes() {
                 <Route path="/class-mode" element={<ClassMode />} />
                 <Route path="/library" element={<LibraryPage />} />
                 <Route path="/paste-save" element={<PasteSavePage />} />
+                <Route path="/ai-batch" element={<AiBatchAddPage />} />
                 <Route path="/sync-status" element={<SyncStatusPage />} />
                 <Route path="/review" element={<TodayReview />} />
                 <Route path="/ai-chat" element={<AiChatPlaceholder />} />

@@ -1,8 +1,25 @@
 import { supabase } from '@/lib/supabase';
 import { offlineDB, type PendingPasteBatch, type PendingPasteRow } from '@/lib/db';
 import { enqueueForReview } from '@/features/capture/addExpression';
-import type { PasteParsedRow } from '@/lib/pasteParser';
 import type { SourceType } from '@/lib/csvImport';
+
+/**
+ * Minimal shape savePasteBatch needs from a row. A plain PasteParsedRow
+ * (src/lib/pasteParser.ts) already satisfies this; the AI-batch flow
+ * (src/features/ai-batch/) passes the same shape plus its extra analysis
+ * fields.
+ */
+export interface SaveBatchRowInput {
+  expressionFr: string;
+  meaningKo: string;
+  tags: string[];
+  correctedFr?: string | null;
+  keyPhrase?: string | null;
+  grammarNote?: string | null;
+  cefrLevel?: string | null;
+  exampleFr?: string | null;
+  exampleTranslationKo?: string | null;
+}
 
 export interface SaveBatchInput {
   userId: string;
@@ -10,7 +27,7 @@ export interface SaveBatchInput {
   sourceType: SourceType;
   sourceLabel: string | null;
   /** Only rows the caller wants saved -- i.e. already filtered to status 'new'. */
-  rows: PasteParsedRow[];
+  rows: SaveBatchRowInput[];
 }
 
 export interface SavedRowResult {
@@ -27,13 +44,19 @@ export interface SaveBatchResult {
   saved: SavedRowResult[];
 }
 
-function toPendingRows(rows: PasteParsedRow[]): PendingPasteRow[] {
+function toPendingRows(rows: SaveBatchRowInput[]): PendingPasteRow[] {
   return rows.map((row) => ({
     rowClientId: crypto.randomUUID(),
     expressionFr: row.expressionFr,
     meaningKo: row.meaningKo,
     tags: row.tags,
-    isSentence: row.isSentence,
+    isSentence: /[.?!]$/.test(row.expressionFr.trim()),
+    correctedFr: row.correctedFr ?? null,
+    keyPhrase: row.keyPhrase ?? null,
+    grammarNote: row.grammarNote ?? null,
+    cefrLevel: row.cefrLevel ?? null,
+    exampleFr: row.exampleFr ?? null,
+    exampleTranslationKo: row.exampleTranslationKo ?? null,
   }));
 }
 
@@ -100,12 +123,42 @@ async function syncOnePasteBatch(batch: PendingPasteBatch): Promise<SavedRowResu
           source_type: batch.sourceType,
           source_label: batch.sourceLabel,
           raw_note_id: rawNote.id,
+          corrected_fr: row.correctedFr ?? null,
+          key_phrase: row.keyPhrase ?? null,
+          grammar_note: row.grammarNote ?? null,
+          cefr_level: row.cefrLevel ?? null,
         },
         { onConflict: 'user_id,client_id' }
       )
       .select('id')
       .single();
     if (error || !expression) throw error ?? new Error('expression_insert_failed');
+
+    if (row.exampleFr) {
+      // expression_examples has no client-side idempotency key of its own,
+      // so a retry of this same batch must check-then-write rather than
+      // upsert, or it would insert a second example every retry.
+      const { data: existingExample } = await supabase
+        .from('expression_examples')
+        .select('id')
+        .eq('expression_id', expression.id)
+        .limit(1)
+        .maybeSingle();
+
+      if (existingExample) {
+        await supabase
+          .from('expression_examples')
+          .update({ sentence_fr: row.exampleFr, translation_ko: row.exampleTranslationKo ?? null })
+          .eq('id', existingExample.id);
+      } else {
+        await supabase.from('expression_examples').insert({
+          expression_id: expression.id,
+          sentence_fr: row.exampleFr,
+          translation_ko: row.exampleTranslationKo ?? null,
+          is_user_created: false,
+        });
+      }
+    }
 
     await enqueueForReview(batch.userId, expression.id);
     saved.push({

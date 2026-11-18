@@ -117,6 +117,28 @@ HashRouter 대신 이 방식을 선택한 이유: Supabase Google OAuth는 PKCE
 나중에 "프롬프트 복사" 버튼과 CSV 미리보기 화면을 별도로 이어서 만들어야
 한다.
 
+## AI 일괄 분석 ("AI 일괄 분석으로 여러 문장 추가")
+
+홈 → [+ 표현 추가] → **"AI 일괄 분석으로 여러 문장 추가"** → `/ai-batch`. 프랑스어
+문장을 최대 100개까지 한 줄에 하나씩 붙여넣으면:
+
+1. `src/lib/pasteParser.ts`(붙여넣기 저장과 동일한 파서)로 줄 단위 분리, 번호/글머리
+   제거, 한글만 있는 줄은 "확인 필요"로 분류
+2. 기존 표현과 비교해 중복 표시(`markPasteDuplicates`, 악센트는 다른 표현으로 취급)
+3. 입력을 멈추고 1초 뒤 **자동으로** `analyze-batch` Edge Function 호출 (15개씩
+   순차 청크 분할, 진행률 표시, 분석 중이면 겹쳐서 다시 호출하지 않음)
+4. 결과를 문장별 카드로 보여주고 번역/문법설명/예문/태그를 저장 전에 수정 가능,
+   문법 오류가 있으면 교정문을 보여주고 적용 여부를 사용자가 토글로 선택
+5. [전체 저장]/[선택 저장] → `src/features/paste-save/pasteSave.ts`의 기존
+   배치 저장 경로(오프라인 큐·raw_notes 보존·review_states 등록 포함)를 그대로 재사용
+6. [실패 항목 재분석] → 실패한 문장만 다시 호출
+
+Edge Function(`supabase/functions/analyze-batch`)은 `analyze-expression`과
+동일한 보안 체크(JWT 검증, Kill Switch, 동시요청 1개, 일일 한도/예산, OpenAI
+키는 서버 Secret에만)를 그대로 적용하고, 청크당 OpenAI 호출 1번으로 문장
+개수만큼 사용량을 차감한다. 응답 개수가 입력 개수와 다르면 그 청크 전체를
+실패로 처리한다(부분 매칭 추측 안 함).
+
 ## 데이터베이스 마이그레이션
 
 `supabase/migrations/`에 번호 순서로 들어있다. **검토 후 Supabase SQL
@@ -132,21 +154,27 @@ Editor(또는 `supabase db push`)에서 직접 실행한다 — 자동으로 적
 7. `0007_chatgpt_prompt_override.sql` — `user_settings.chatgpt_prompt_override` (설정에서 ChatGPT 프롬프트 수정용, 아직 설정 UI는 미구현)
 8. `0008_raw_notes.sql` — `raw_notes`(붙여넣은 원문 보존) + `expressions.raw_note_id`
 9. `0009_fix_client_id_conflict_targets.sql` — **중요 버그 수정**: `expressions`/`raw_notes`의 `client_id` 유니크 인덱스가 부분 인덱스(`WHERE client_id IS NOT NULL`)였는데, 앱의 모든 upsert는 조건 없는 `ON CONFLICT (user_id, client_id)`를 써서 Postgres가 매칭을 못 해 **모든 저장이 실패**하고 있었음. `client_id`를 NOT NULL로 만들고 일반 UNIQUE 제약으로 교체. 이 마이그레이션 전까지는 앱에서 저장한 어떤 표현도 실제로 Supabase에 반영되지 않았을 가능성이 높음
+10. `0010_ai_batch_fields.sql` — `expressions.corrected_fr`/`key_phrase` 추가, `ai_rate_limits.daily_expression_analyses` 기본값 30→150 (일괄 분석 최대 100개를 감당하기 위함, 기존 행도 갱신)
 
 ## Edge Function 배포
 
 ```bash
 supabase link --project-ref xwbcpanispdyrchddnzi
 supabase functions deploy analyze-expression
+supabase functions deploy analyze-batch
 supabase secrets set OPENAI_API_KEY=sk-...   # 터미널에만 직접 입력. 채팅/코드에 쓰지 않기.
 ```
 
 보안 지시서 원칙: **보안 테스트(인증 차단, RLS, 동시 요청 제한, Kill
-Switch)를 통과하기 전에는 실제 OpenAI 키를 연결하지 않는다.**
+Switch)를 통과하기 전에는 실제 OpenAI 키를 연결하지 않는다.** (지금까지
+이 원칙을 지켜 실제 키는 아직 연결하지 않았다 — `analyze-batch`도 동일.)
+
+모델을 바꾸려면 `ai_rate_limits.allowed_models` 배열을 SQL로 직접
+수정하면 된다(예: `update ai_rate_limits set allowed_models = array['gpt-4o'] where user_id = '...'`) — 별도 UI는 만들지 않았다.
 
 ## 사용자가 직접 해야 하는 설정 (Claude Code가 대신 할 수 없는 작업)
 
-1. **Supabase 마이그레이션 적용**: 위 8개 SQL을 순서대로 SQL Editor에서 실행 (0006~0008은 새로 추가됨, 아직 미실행이면 검토 후 적용)
+1. **Supabase 마이그레이션 적용**: 위 10개 SQL을 순서대로 SQL Editor에서 실행 (0010이 새로 추가됨, 아직 미실행이면 검토 후 적용)
 2. **Google OAuth**:
    - Google Cloud Console에서 OAuth 클라이언트 생성, 승인된 리디렉션 URI에
      `https://xwbcpanispdyrchddnzi.supabase.co/auth/v1/callback` 등록
@@ -160,7 +188,7 @@ Switch)를 통과하기 전에는 실제 OpenAI 키를 연결하지 않는다.**
      `VITE_SUPABASE_URL`, `VITE_SUPABASE_PUBLISHABLE_KEY` 등록
 5. **로컬 `.env.local`**: 위 환경 변수 표 참고
 6. **OpenAI API 키**: 보안 테스트 통과 후 `supabase secrets set OPENAI_API_KEY=...`
-7. **Edge Function 배포**: 위 "Edge Function 배포" 절 참고
+7. **Edge Function 배포**: 위 "Edge Function 배포" 절 참고 (`analyze-expression`, `analyze-batch` 둘 다)
 8. **최초 push**: `git push -u origin main` (원격 저장소가 비어있는 것을 확인했으므로 안전)
 
 ## 테스트 결과
@@ -169,16 +197,21 @@ Switch)를 통과하기 전에는 실제 OpenAI 키를 연결하지 않는다.**
 
 - `npm run typecheck` — 통과
 - `npm run build` — 통과 (더미 env로 로컬 빌드, 번들에 비밀키 누출 없음 확인)
-- `npm test` (`vitest`) — **39개 테스트 통과**
+- `npm test` (`vitest`) — **57개 테스트 통과**
   - `normalizeFr.test.ts` (3개)
   - `pasteParser.test.ts` (36개): 유저 예시 3줄 분리, 글머리 기호 9종,
     원형 숫자, 마크다운 굵게/코드/표, 구분자 8종, `peut-être`/`Qu'est-ce
     que`/`Est-ce que` 보존, 프랑스어만 있는 줄, 제목→tags, 한글만 있는
     줄→확인 필요, 설명 문장 무시, 빈 줄 무시, 중복(정확 일치/악센트
     다름/아포스트로피 통일/배치 내 반복/재붙여넣기) 전부 포함
-- `src/lib/csvImport.ts`용 자동 테스트는 **아직 작성 안 함** (이번 우선순위
-  변경으로 `/paste-save`에 집중했고, CSV 미리보기 플로우는 화면까지
-  만들지 않아 보류)
+  - `addExpression.test.ts` (5개): [+ 표현 추가] 입력이 fr/ko로 분리되는지, 출처 키워드→school 매핑
+  - `aiBatchClient.test.ts` (13개, `supabase.functions.invoke` 모킹): 청크 분할 경계값,
+    성공/서버 에러/개수 불일치/네트워크 예외 각각의 실패 처리, 청크 하나가
+    실패해도 나머지 청크는 계속 진행, 실패 청크만 모아내는 로직
+- `src/lib/csvImport.ts`용 자동 테스트는 **아직 작성 안 함** (CSV 미리보기 플로우는
+  화면까지 만들지 않아 보류 — AI 일괄 분석은 별도의 `pasteParser` 기반 경로로 구현)
+- `analyze-batch`/`analyze-expression` Edge Function 자체(실제 OpenAI 응답 처리)는
+  실키를 연결하지 않아 **미검증**
 
 ### 수동 (사용자 환경에서만 가능 — 미검증)
 
@@ -195,6 +228,8 @@ Switch)를 통과하기 전에는 실제 OpenAI 키를 연결하지 않는다.**
 - Edge Function: 비로그인/위조 JWT 차단, 동시 요청 제한, Kill Switch 동작
 - GitHub Actions 빌드 성공 및 자동 재배포
 - PWA 설치, 오프라인 저장 → 재연결 시 동기화
+- `/ai-batch`: 실제 문장 여러 개 붙여넣기 → 1초 디바운스 자동 분석 → 결과
+  카드 표시 → 저장 → 표현장/오늘복습 반영 (OpenAI 키 연결 후에만 가능)
 
 ## 향후 개선 목록 (Phase 2 / 3, 지시서 §18 기준)
 

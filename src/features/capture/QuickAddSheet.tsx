@@ -1,3 +1,4 @@
+import { Link } from 'react-router-dom';
 import { QuickAddForm } from '@/features/capture/QuickAddForm';
 
 interface QuickAddSheetProps {
@@ -22,6 +23,13 @@ export function QuickAddSheet({ open, onClose, onSaved }: QuickAddSheetProps) {
           </button>
         </div>
         <QuickAddForm sourceType="manual" onSaved={onSaved} />
+        <Link
+          to="/ai-batch"
+          onClick={onClose}
+          className="mt-3 block rounded-full border border-blue-600 py-2 text-center text-sm font-semibold text-blue-600 dark:text-blue-400"
+        >
+          AI 일괄 분석으로 여러 문장 추가
+        </Link>
       </div>
     </div>
   );
