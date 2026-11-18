@@ -374,7 +374,8 @@ export default function VocabularyDetailPage() {
           </div>
         )}
 
-        {!usageDetails.some((u) => u.source === 'dictionary') && <SeedDictionaryPanel lemmaId={lemma.id} onSaved={invalidate} />}
+        {/* always available: same constructions merge into existing usages, so re-running never duplicates */}
+        <SeedDictionaryPanel lemmaId={lemma.id} onSaved={invalidate} />
       </Accordion>
 
       {/* D. 활용표 */}

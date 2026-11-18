@@ -43,7 +43,7 @@ import { canonicalizePattern } from '../_shared/patternNotation.ts';
 import {
   SEED_GENERATE_RESPONSE_SCHEMA,
   SEED_GENERATE_SYSTEM_PROMPT,
-  SEED_MAX_SENSES,
+  SEED_MAX_CANDIDATES,
   SEED_VERIFY_RESPONSE_SCHEMA,
   SEED_VERIFY_SYSTEM_PROMPT,
   buildSeedGenerateUserPrompt,
@@ -256,11 +256,14 @@ async function handleSeedDictionary(admin: ReturnType<typeof createClient>, user
   // ---- apply: save what the user picked from the preview. No AI call; the
   // code rules run again (the body is client input), then merge/insert.
   if (mode === 'apply') {
-    const raw = Array.isArray(body.senses) ? body.senses.slice(0, SEED_MAX_SENSES) : [];
-    const senses = raw.map(sanitizeSense).filter((s): s is SeedSense => s !== null);
-    if (senses.length === 0) return jsonResponse({ error: 'no_senses' }, 400);
+    const raw = Array.isArray(body.senses) ? body.senses.slice(0, SEED_MAX_CANDIDATES) : [];
+    const pairs = raw
+      .map((r) => ({ sense: sanitizeSense(r), mergeInto: typeof (r as { mergeInto?: unknown })?.mergeInto === 'string' ? ((r as { mergeInto: string }).mergeInto) : null }))
+      .filter((p): p is { sense: SeedSense; mergeInto: string | null } => p.sense !== null);
+    if (pairs.length === 0) return jsonResponse({ error: 'no_senses' }, 400);
     const existing = await loadExisting();
-    const { accepted, rejected } = prepareSeedSenses(senses, null, existing);
+    // mergeInto is honoured only when it is a similar (qqn/qqch) usage of THIS lemma -- checked inside prepareSeedSenses
+    const { accepted, rejected } = prepareSeedSenses(pairs.map((p) => p.sense), null, existing, { chosenMerges: pairs.map((p) => p.mergeInto) });
 
     const { count: existingCount } = await admin.from('lemma_usages').select('id', { count: 'exact', head: true }).eq('lemma_id', lemmaId);
     let sortOrder = existingCount ?? 0;
@@ -294,7 +297,8 @@ async function handleSeedDictionary(admin: ReturnType<typeof createClient>, user
           pattern: sense.pattern,
           required_complement: sense.required_complement,
           mood_requirement: sense.mood_requirement === 'none' ? null : sense.mood_requirement,
-          grammar_explanation_ko: sense.grammar_explanation_ko,
+          // no dedicated columns for these: kept in the explanation the card already shows
+          grammar_explanation_ko: [sense.grammar_explanation_ko, sense.contrast_ko, sense.mood_note_ko].filter(Boolean).join(' '),
           common_mistakes_ko: sense.common_mistakes_ko,
           ai_example_sentences: sense.examples,
           source: 'dictionary',
@@ -347,7 +351,7 @@ async function handleSeedDictionary(admin: ReturnType<typeof createClient>, user
           model,
           schema: SEED_GENERATE_RESPONSE_SCHEMA,
           schemaName: 'seed_dictionary',
-          maxOutputTokens: 2500,
+          maxOutputTokens: 5000,
         });
         await account(model, payload.inputTokens, payload.outputTokens);
         generated = ((payload.parsed as { senses: unknown[] }).senses ?? []).map(sanitizeSense).filter((s): s is SeedSense => s !== null);
@@ -363,6 +367,7 @@ async function handleSeedDictionary(admin: ReturnType<typeof createClient>, user
 
     // Self-check with the stronger model. Fail closed: no verdicts -> nothing offered.
     let verdicts: SeedVerdict[];
+    let missing: SeedSense[] = [];
     try {
       const payload = await callOpenAIJsonSchema({
         apiKey: OPENAI_API_KEY,
@@ -371,17 +376,19 @@ async function handleSeedDictionary(admin: ReturnType<typeof createClient>, user
         model: SEED_VERIFY_MODEL,
         schema: SEED_VERIFY_RESPONSE_SCHEMA,
         schemaName: 'seed_verify',
-        maxOutputTokens: 3000,
+        maxOutputTokens: 6000,
         temperature: 0,
       });
       await account(SEED_VERIFY_MODEL, payload.inputTokens, payload.outputTokens);
-      verdicts = (payload.parsed as { verdicts: SeedVerdict[] }).verdicts;
+      const parsed = payload.parsed as { verdicts: SeedVerdict[]; missing: unknown[] };
+      verdicts = parsed.verdicts;
+      missing = (parsed.missing ?? []).map(sanitizeSense).filter((s): s is SeedSense => s !== null);
     } catch (err) {
       console.error('[analyze-lemma] seed verify failed', err instanceof Error ? err.message : err);
       return jsonResponse({ error: 'verification_failed', message: '검증 단계가 실패해서 아무것도 추가하지 않았어요.' }, 502);
     }
 
-    const { accepted, rejected } = prepareSeedSenses(generated, verdicts, await loadExisting());
+    const { accepted, rejected } = prepareSeedSenses([...generated, ...missing], verdicts, await loadExisting(), { missingFromIndex: generated.length });
     await admin.rpc('increment_ai_usage', { p_user_id: userId, p_cost_usd: totalCost, p_expression_analyses: 1 });
     return jsonResponse({ ok: true, senses: accepted, rejected, models: { generate: model, verify: SEED_VERIFY_MODEL } });
   } finally {

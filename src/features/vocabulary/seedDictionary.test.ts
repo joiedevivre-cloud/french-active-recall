@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
-  SEED_MAX_SENSES,
+  SEED_MAX_CANDIDATES,
+  grammarTermsFor,
+  looseKey,
   mergeExamples,
   prepareSeedSenses,
   sanitizeSense,
@@ -14,8 +16,11 @@ const sense = (label: string, pattern: string, fr = `Exemple ${label}.`): SeedSe
   label,
   meaning_ko: label,
   pattern,
+  tier: 'core',
   required_complement: 'nom',
   mood_requirement: 'none',
+  mood_note_ko: '',
+  contrast_ko: '',
   grammar_explanation_ko: '',
   common_mistakes_ko: [],
   examples: [{ fr, ko: label }],
@@ -29,7 +34,7 @@ const generated: SeedSense[] = [
 ];
 const existing = [{ id: 'U-learned', label: '비밀을 털어놓다', pattern: 'se confier à + groupe nominal (personne)' }];
 const keepAll = (s: SeedSense[]): SeedVerdict[] =>
-  s.map((x, index) => ({ index, verdict: 'keep', label: x.label, meaning_ko: x.meaning_ko, pattern: x.pattern, examples: x.examples, reason_ko: '' }));
+  s.map((x, index) => ({ index, verdict: 'keep', label: x.label, meaning_ko: x.meaning_ko, pattern: x.pattern, tier: x.tier, examples: x.examples, reason_ko: '' }));
 
 describe('prepareSeedSenses (code rules behind the AI self-check)', () => {
   it('the old "의탁하다" duplicate now merges into the learned usage instead of a new one', () => {
@@ -80,11 +85,54 @@ describe('prepareSeedSenses (code rules behind the AI self-check)', () => {
     expect(rejected[0].reason_ko).toMatch(/같은 구문/);
   });
 
-  it(`at most ${SEED_MAX_SENSES} usages, a usage without examples is rejected, missing verdict fails closed`, () => {
-    const many = ['a', 'b', 'c', 'd', 'e'].map((x) => sense(x, `verbe ${x} qqch`));
-    expect(prepareSeedSenses(many, null, []).accepted).toHaveLength(SEED_MAX_SENSES);
+  it('no learning limit: every valid construction is kept, core before extra; safety cap lists what it cut', () => {
+    const five = ['a', 'b', 'c', 'd', 'e'].map((x, i) => ({ ...sense(x, `verbe ${x} qqch`), tier: (i === 0 ? 'extra' : 'core') as 'core' | 'extra' }));
+    const { accepted } = prepareSeedSenses(five, null, []);
+    expect(accepted).toHaveLength(5);
+    expect(accepted[accepted.length - 1].label).toBe('a'); // extra goes last
+    const many = Array.from({ length: SEED_MAX_CANDIDATES + 2 }, (_, i) => sense(`s${i}`, `verbe${i} qqch`));
+    const capped = prepareSeedSenses(many, null, []);
+    expect(capped.accepted).toHaveLength(SEED_MAX_CANDIDATES);
+    expect(capped.rejected).toHaveLength(2);
+  });
+
+  it('constructions the self-check reports as missing are offered and marked', () => {
+    const gen = [sense('생각하다', 'penser à qqch', 'Je pense à mes vacances.')];
+    const missing = [sense('평가하다', 'penser de qqch', 'Que penses-tu de ce film ?')];
+    const { accepted } = prepareSeedSenses([...gen, ...missing], keepAll(gen), [], { missingFromIndex: 1 });
+    expect(accepted.map((a) => [a.pattern, a.checked])).toEqual([
+      ['penser à qqch', 'keep'],
+      ['penser de qqch', 'added'],
+    ]);
+  });
+
+  it('qqn/qqch-only difference -> suggested, merged only when the learner chose it', () => {
+    const ex = [{ id: 'U-qqn', label: '생각하다', pattern: 'penser à qqn' }];
+    const s1 = [sense('생각하다', 'penser à qqch', 'Je pense à mes vacances.')];
+    const suggested = prepareSeedSenses(s1, null, ex).accepted[0];
+    expect(suggested.mergeTargetId).toBeNull();
+    expect(suggested.similarTargetId).toBe('U-qqn');
+    const chosen = prepareSeedSenses(s1, null, ex, { chosenMerges: ['U-qqn'] }).accepted[0];
+    expect(chosen.mergeTargetId).toBe('U-qqn');
+    // a forged merge target (not similar) is ignored
+    expect(prepareSeedSenses(s1, null, [{ id: 'U-x', label: 'x', pattern: 'penser que + proposition' }], { chosenMerges: ['U-x'] }).accepted[0].mergeTargetId).toBeNull();
+    expect(looseKey('penser à qqn/qqch')).toBe(looseKey('penser à qqn'));
+    expect(looseKey('penser de qqch')).not.toBe(looseKey('penser à qqch'));
+  });
+
+  it('a usage without examples is rejected; a missing verdict fails closed', () => {
     expect(prepareSeedSenses([{ ...sense('x', 'faire qqch'), examples: [] }], null, []).accepted).toHaveLength(0);
     expect(prepareSeedSenses([sense('x', 'faire qqch')], [], []).accepted).toHaveLength(0);
+  });
+});
+
+describe('grammarTermsFor (French terms on each usage card, from the pattern)', () => {
+  it('names prepositions, infinitive, completive clause and mood', () => {
+    expect(grammarTermsFor('penser de qqch', 'none')).toEqual(['préposition de']);
+    expect(grammarTermsFor('penser à + inf.', 'none')).toEqual(['préposition à', 'infinitif']);
+    expect(grammarTermsFor('penser que + proposition', 'indicatif')).toEqual(['proposition subordonnée complétive', 'indicatif']);
+    expect(grammarTermsFor('confier qqch à qqn', 'none')).toEqual(["complément d'objet direct", 'préposition à', "complément d'objet indirect"]);
+    expect(grammarTermsFor('se confier à qqn', 'none')).toEqual(['verbe pronominal', 'préposition à', "complément d'objet indirect"]);
   });
 });
 
