@@ -243,6 +243,67 @@ Vitest 양쪽에서 같은 파일 import, `lemmaMatching.ts`와 동일 패턴).
 - 기존 v1/v2 분석은 그대로 표시된다(v3 필드는 전부 optional). 새 형식으로
   보려면 `[AI 다시 분석]`을 누른다.
 
+## 관리자 전용 AI 프롬프트 관리 (`/admin/prompts`, 1단계)
+
+코드를 다시 배포하지 않고 **문장 분석 프롬프트**(`prompt_key = 'sentence-analysis'`)를
+관리자 화면에서 수정, 테스트, 비교, 활성화하고 이전 버전으로 되돌린다.
+`'word-analysis'` / `analyze-word`는 나중에 만들 단어 분석 기능용으로 남겨 둔
+이름이라 지금은 쓰지 않는다.
+
+- **대상 프롬프트와 이 프롬프트를 쓰는 AI 경로** (모두 같은 로더
+  `supabase/functions/_shared/promptLoader.ts`를 거쳐 active 버전을 사용):
+  - `analyze-lemma`(classify): 표현을 저장할 때와 `[다시 생성]`을 누를 때 실행되고 `expression_analysis`에 저장
+  - `admin-prompts`(미리보기·비교): 결과는 `prompt_test_runs`에만 저장
+  - `scripts/backfill-analysis.ts`
+  - `analyze-batch`는 다른 프롬프트(뜻·상세 분석)를 쓰고
+    `expression_analysis`에 쓰지 않으므로 대상이 아니다.
+    `analyze-expression`은 호출하는 곳이 없다(파일 상단에 deprecated 표시).
+  - `seed_dictionary` 프롬프트는 이번 범위에서 제외했다.
+- **구성**: 편집 가능한 `instructions`({{변수}}는 settings 값으로 치환) 뒤에
+  코드에 잠긴 **출력 형식(output contract)**이 항상 자동으로 붙는다.
+  contract에는 JSON 필드 정의와 쓰임 재사용 규칙이 들어 있다. 코드의 패턴
+  검증(`resolveExistingUsageId`)이 이 규칙에 의존하므로 관리자가 바꿀 수 없다.
+- **버전 규칙** (DB에서 보장, `0018`):
+  - prompt_key마다 active는 1개만 허용(부분 유니크 인덱스)
+  - active·archived 버전은 수정·삭제할 수 없음(트리거). 수정은 항상 새 draft로 한다.
+  - 복원은 옛 버전을 복사해 새 draft를 만드는 방식이다. 테스트를 통과한 뒤 활성화한다.
+  - 활성화(`activate_prompt_version`)는 한 트랜잭션에서 처리한다. 조건은
+    change_note 필수, draft를 마지막으로 수정한 뒤 테스트 세트 14문장의 최신 실행이
+    전부 통과했을 것이다.
+- **로더**: active 버전을 60초 동안 메모리에 캐시한다. DB를 읽지 못하면 코드의 기본
+  프롬프트(v1과 동일)로 대체하고 로그를 한 줄 남긴다(문장·프롬프트 원문은
+  로그에 남기지 않음). 버전에 지정된 model은 사용자의 `allowed_models` 안에
+  있을 때만 쓴다. `expression_analysis.prompt_version_id`에 어느 버전으로
+  분석했는지 기록한다. fallback으로 분석했으면 null이다.
+- **스키마 검증**: Structured Outputs의 strict 모드에서는 JSON 형식이 거의 항상
+  맞게 나오므로, 형식 대신 **의미**를 검사한다
+  (`_shared/sentenceAnalysisValidation.ts`):
+  - 빈 필드
+  - IPA 형식(`/…/`, 한글 금지)
+  - grammar_points 1~3개, level 값
+  - 전달하지 않은 `existing_usage_id`
+  - 테스트 케이스별 기대값(`pattern_includes`)
+  - **재귀형 mettre 규칙**: je me / tu te / se / nous nous / vous vous / mets-toi
+    + mettre 문장이 "se mettre"가 아닌 기본 의미 쓰임에 배정되면 실패
+    (`hasReflexiveMettre`). 어제 만든 패턴 일치 검사와는 다른 규칙이라 새
+    함수로 만들었다. 주어와 대명사가 일치할 때만 재귀형으로 보므로
+    "Il me met en colère"처럼 목적어 대명사인 경우는 걸리지 않는다.
+- **미리보기**: 학습 데이터 테이블에는 쓰지 않는다. 내 기존 쓰임 목록은 읽기만
+  한다. 화면에서 동시 3개씩 호출하고, Kill Switch, 일일·월간 예산, 하루 300회 제한을
+  적용한다(`ai_usage_log.feature = 'prompt_admin'`).
+
+### 관리자 권한 설정 (한 번만)
+
+```sql
+update auth.users
+set raw_app_meta_data = coalesce(raw_app_meta_data, '{}'::jsonb) || '{"role":"admin"}'
+where email = '<본인 이메일>';
+```
+실행 후 **로그아웃했다가 다시 로그인**해야 토큰에 반영된다. `app_metadata`는 사용자가
+직접 바꿀 수 없는 값이다(`user_metadata`와 다름). 설정 화면에 "관리자: AI 프롬프트
+관리" 링크가 보이지만 이건 편의 기능일 뿐이고, 권한은 `admin-prompts` 함수가
+서버에서 확인한다. 관리자가 아니면 403을 반환한다.
+
 ## 단어장 (lemma/쓰임 분류)
 
 표현장의 표현들을 핵심 단어(lemma, 예: "mettre") 기준으로 묶어서 쓰임별로
@@ -408,14 +469,27 @@ Editor(또는 `supabase db push`)에서 직접 실행한다 — 자동으로 적
     8000으로 올림. 일괄 분석은 코드에서 4000으로 따로 막혀 있음. 데이터
     삭제 없음. **`analyze-batch` 배포 전에 실행**
 
+18. `0018_prompt_management.sql` — 관리자 프롬프트 관리:
+    - 신규 `prompt_versions` / `prompt_test_cases`(기본 14문장) /
+      `prompt_test_runs`. RLS를 켜고 정책을 두지 않으며 anon/authenticated 권한을 제거해서
+      일반 사용자는 접근할 수 없다.
+    - active 1개 인덱스, 수정·삭제 방지 트리거, 버전 번호 자동 증가,
+      `activate_prompt_version` RPC(service_role 전용)
+    - v1 시드(코드 프롬프트와 바이트 단위로 같은지 테스트로 확인)
+    - `expression_analysis.prompt_version_id` 추가(기존 행은 v1로 채움, 기존 `prompt_version`
+      문자열은 유지)
+    - `ai_usage_log.feature`에 `prompt_admin` 추가
+    - 데이터 삭제 없음
+
 ## Edge Function 배포
 
 ```bash
 supabase link --project-ref xwbcpanispdyrchddnzi
-supabase functions deploy analyze-expression
 supabase functions deploy analyze-batch
 supabase functions deploy analyze-lemma
 supabase functions deploy writing-practice
+supabase functions deploy admin-prompts
+# analyze-expression: deprecated (호출하는 곳 없음) -- 다시 배포할 필요 없음
 supabase secrets set OPENAI_API_KEY=sk-...   # 터미널에만 직접 입력. 채팅/코드에 쓰지 않기.
 ```
 

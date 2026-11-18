@@ -1,8 +1,10 @@
 import { useAuth } from '@/contexts/AuthContext';
 import { useSettings } from '@/contexts/SettingsContext';
+import { Link } from 'react-router-dom';
+import { isAdminSession } from '@/lib/isAdmin';
 
 export default function SettingsPage() {
-  const { user, signOut } = useAuth();
+  const { user, session, signOut } = useAuth();
   const { settings, updateSettings, isLoading } = useSettings();
 
   if (isLoading || !settings) {
@@ -104,6 +106,13 @@ export default function SettingsPage() {
         />
         <p className="mt-1 text-xs text-slate-400">높을수록 복습 간격이 짧아지고 더 자주 복습합니다 (FSRS 설정값).</p>
       </div>
+
+      {/* 메뉴 숨김은 편의 기능일 뿐 -- 실제 권한은 admin-prompts 함수가 서버에서 확인 */}
+      {isAdminSession(session) && (
+        <Link to="/admin/prompts" className="rounded-xl border border-slate-300 p-3 text-sm dark:border-slate-700">
+          🛠 관리자: AI 프롬프트 관리
+        </Link>
+      )}
 
       <div className="mt-4 border-t border-slate-200 pt-4 dark:border-slate-800">
         <p className="text-sm text-slate-400">{user?.email}</p>

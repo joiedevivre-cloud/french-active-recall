@@ -16,6 +16,7 @@ import SyncStatusPage from '@/features/sync-status/SyncStatusPage';
 import TodayReview from '@/features/review/TodayReview';
 import AiChatPlaceholder from '@/features/ai-chat/AiChatPlaceholder';
 import SettingsPage from '@/features/settings/SettingsPage';
+import AdminPromptsPage from '@/features/admin/AdminPromptsPage';
 
 export function AppRoutes() {
   return (
@@ -41,6 +42,7 @@ export function AppRoutes() {
                 <Route path="/review" element={<TodayReview />} />
                 <Route path="/ai-chat" element={<AiChatPlaceholder />} />
                 <Route path="/settings" element={<SettingsPage />} />
+                <Route path="/admin/prompts" element={<AdminPromptsPage />} />
               </Routes>
             </AppShell>
           </ProtectedRoute>

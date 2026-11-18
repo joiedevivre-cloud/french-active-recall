@@ -1,3 +1,10 @@
+// ============================================================================
+// DEPRECATED, 사용 안 함 (2026-11-18). No code path calls this function:
+// saving an expression runs analyze-batch (meaning/light analysis) and then
+// analyze-lemma (sentence analysis -> expression_analysis). Kept only until
+// a later cleanup -- do not add features here and do not route new calls to it.
+// ============================================================================
+//
 // Supabase Edge Function: analyze-expression
 //
 // Called (fire-and-forget) right after a user saves a raw expression. Looks

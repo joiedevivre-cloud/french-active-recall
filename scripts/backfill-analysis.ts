@@ -13,9 +13,8 @@
 // Requires .env.local with SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, OPENAI_API_KEY.
 import { createClient } from '@supabase/supabase-js';
 import {
-  ANALYZE_SYSTEM_PROMPT,
   ANALYZE_RESPONSE_SCHEMA,
-  PROMPT_VERSION,
+  SENTENCE_ANALYSIS_PROMPT_KEY,
   buildUserPrompt,
   type AnalyzeAiResult,
   type ExistingLemmaContext,
@@ -28,6 +27,10 @@ import {
   shouldPreserveField,
   shouldRetryAfterSchemaFailure,
 } from '../supabase/functions/_shared/lemmaMatching.ts';
+// Same DB-managed prompt as analyze-lemma (active prompt_versions row,
+// code fallback if unreadable) -- see supabase/functions/_shared/promptLoader.ts.
+import { loadActivePrompt, type LoadedPrompt } from '../supabase/functions/_shared/promptLoader.ts';
+import { callOpenAIJsonSchema } from '../supabase/functions/_shared/openaiJson.ts';
 
 try {
   process.loadEnvFile('.env.local');
@@ -38,7 +41,9 @@ try {
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const MODEL = 'gpt-4o-mini';
+const DEFAULT_MODEL = 'gpt-4o-mini';
+let activePrompt: LoadedPrompt;
+let MODEL = DEFAULT_MODEL;
 const CONCURRENCY = 3;
 const MAX_SCHEMA_RETRY_ATTEMPTS = 2;
 
@@ -60,6 +65,9 @@ async function main() {
   }
 
   const admin = createClient(SUPABASE_URL, SERVICE_ROLE_KEY);
+  activePrompt = await loadActivePrompt(admin, SENTENCE_ANALYSIS_PROMPT_KEY);
+  MODEL = activePrompt.model ?? DEFAULT_MODEL;
+  console.log(`prompt: ${activePrompt.versionLabel} (source: ${activePrompt.source}), model: ${MODEL}`);
 
   const { data: config } = await admin.from('ai_system_config').select('ai_enabled').eq('id', true).single();
   if (!config?.ai_enabled) {
@@ -225,7 +233,8 @@ async function analyzeOne(
       grammar_points: ai.grammar_points,
       level: ai.level,
       model: MODEL,
-      prompt_version: PROMPT_VERSION,
+      prompt_version: activePrompt.versionLabel,
+      prompt_version_id: activePrompt.versionId,
     },
     { onConflict: 'expression_id' }
   );
@@ -235,31 +244,17 @@ async function analyzeOne(
 }
 
 async function callOpenAI(sentence: string, existingLemmas: ExistingLemmaContext[]): Promise<AnalyzeAiResult> {
-  const response = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model: MODEL,
-      max_tokens: 1200,
-      response_format: { type: 'json_schema', json_schema: { name: 'lemma_analysis', strict: true, schema: ANALYZE_RESPONSE_SCHEMA } },
-      messages: [
-        { role: 'system', content: ANALYZE_SYSTEM_PROMPT },
-        { role: 'user', content: buildUserPrompt(sentence, existingLemmas) },
-      ],
-    }),
+  const { parsed } = await callOpenAIJsonSchema({
+    apiKey: OPENAI_API_KEY!,
+    systemPrompt: activePrompt.systemPrompt,
+    userPrompt: buildUserPrompt(sentence, existingLemmas),
+    model: MODEL,
+    schema: ANALYZE_RESPONSE_SCHEMA,
+    schemaName: 'lemma_analysis',
+    maxOutputTokens: 1200,
+    temperature: activePrompt.temperature,
   });
-  if (!response.ok) {
-    const body = await response.text().catch(() => '');
-    throw new Error(`openai_http_${response.status}: ${body.slice(0, 500)}`);
-  }
-  const payload = await response.json();
-  const choice = payload.choices?.[0];
-  const content = choice?.message?.content;
-  if (!content) throw new Error('openai_empty_response');
-  if (choice?.finish_reason && choice.finish_reason !== 'stop') {
-    throw new Error(`output_truncated: finish_reason=${choice.finish_reason}`);
-  }
-  return JSON.parse(content) as AnalyzeAiResult;
+  return parsed as AnalyzeAiResult;
 }
 
 main().catch((err) => {

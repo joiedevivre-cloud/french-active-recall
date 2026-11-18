@@ -15,11 +15,10 @@
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 import { corsHeaders, jsonResponse } from '../_shared/cors.ts';
 import {
-  ANALYZE_SYSTEM_PROMPT,
   ANALYZE_RESPONSE_SCHEMA,
   SEED_DICTIONARY_SYSTEM_PROMPT,
   SEED_DICTIONARY_RESPONSE_SCHEMA,
-  PROMPT_VERSION,
+  SENTENCE_ANALYSIS_PROMPT_KEY,
   buildUserPrompt,
   buildSeedDictionaryUserPrompt,
   type AnalyzeAiResult,
@@ -36,6 +35,11 @@ import {
   findMergeTargetUsageId,
   shouldRetryAfterSchemaFailure,
 } from '../_shared/lemmaMatching.ts';
+// The sentence-analysis prompt is DB-managed (/admin/prompts, migration
+// 0018); classify always uses the ACTIVE version via the shared loader.
+import { loadActivePrompt, type LoadedPrompt } from '../_shared/promptLoader.ts';
+import { pickAllowedModel } from '../_shared/promptTemplate.ts';
+import { callOpenAIJsonSchema } from '../_shared/openaiJson.ts';
 
 const SUPABASE_URL = Deno.env.get('SUPABASE_URL')!;
 const SUPABASE_ANON_KEY = Deno.env.get('SUPABASE_ANON_KEY')!;
@@ -147,7 +151,9 @@ async function handleClassify(admin: ReturnType<typeof createClient>, userId: st
       return jsonResponse({ error: 'openai_key_not_configured' }, 500);
     }
 
-    const model = limits.allowed_models?.[0] ?? 'gpt-4o-mini';
+    const prompt = await loadActivePrompt(admin, SENTENCE_ANALYSIS_PROMPT_KEY);
+    // The version may name a model, but the user's allowed_models list keeps the final say.
+    const model = pickAllowedModel(prompt.model, limits.allowed_models);
     const pricing = MODEL_PRICING_PER_1M_TOKENS[model] ?? MODEL_PRICING_PER_1M_TOKENS['gpt-4o-mini'];
 
     const { data: existingLemmaRows } = await admin.from('lemmas').select('id, lemma, part_of_speech').eq('user_id', userId);
@@ -175,7 +181,7 @@ async function handleClassify(admin: ReturnType<typeof createClient>, userId: st
       let lastError: string | null = null;
       for (let attempt = 0; attempt < MAX_SCHEMA_RETRY_ATTEMPTS; attempt++) {
         try {
-          const completion = await callClassifyOpenAI(sentence, existingLemmaContext, model);
+          const completion = await callClassifyOpenAI(sentence, existingLemmaContext, model, prompt);
           ai = completion.result;
           totalInputTokens += completion.inputTokens;
           totalOutputTokens += completion.outputTokens;
@@ -193,7 +199,7 @@ async function handleClassify(admin: ReturnType<typeof createClient>, userId: st
       }
 
       try {
-        const applied = await applyClassifyResult(admin, userId, expressionId, ai, existingByExprId.get(expressionId) ?? null, model);
+        const applied = await applyClassifyResult(admin, userId, expressionId, ai, existingByExprId.get(expressionId) ?? null, model, prompt);
         results.push({ expression_id: expressionId, status: 'success', ...applied });
       } catch (err) {
         console.error('[analyze-lemma] db_write_failed', expressionId, err instanceof Error ? err.message : err);
@@ -376,7 +382,8 @@ async function applyClassifyResult(
   expressionId: string,
   ai: AnalyzeAiResult,
   existingAnalysis: { lemma_id: string; usage_id: string; usage_user_assigned: boolean } | null,
-  model: string
+  model: string,
+  prompt: LoadedPrompt
 ) {
   const { data: lemma, error: lemmaError } = await admin
     .from('lemmas')
@@ -458,7 +465,8 @@ async function applyClassifyResult(
       grammar_points: ai.grammar_points,
       level: ai.level,
       model,
-      prompt_version: PROMPT_VERSION,
+      prompt_version: prompt.versionLabel, // legacy text column, kept
+      prompt_version_id: prompt.versionId, // null only when the code fallback was used
     },
     { onConflict: 'expression_id' }
   );
@@ -474,68 +482,34 @@ async function applyClassifyResult(
   return { lemma_id: lemmaId, usage_id: usageId };
 }
 
-async function callClassifyOpenAI(sentence: string, existingLemmas: ExistingLemmaContext[], model: string): Promise<{ result: AnalyzeAiResult; inputTokens: number; outputTokens: number }> {
-  const payload = await callOpenAIJsonSchema(ANALYZE_SYSTEM_PROMPT, buildUserPrompt(sentence, existingLemmas), model, ANALYZE_RESPONSE_SCHEMA, 'lemma_analysis', 1200);
+async function callClassifyOpenAI(
+  sentence: string,
+  existingLemmas: ExistingLemmaContext[],
+  model: string,
+  prompt: LoadedPrompt
+): Promise<{ result: AnalyzeAiResult; inputTokens: number; outputTokens: number }> {
+  const payload = await callOpenAIJsonSchema({
+    apiKey: OPENAI_API_KEY!,
+    systemPrompt: prompt.systemPrompt,
+    userPrompt: buildUserPrompt(sentence, existingLemmas),
+    model,
+    schema: ANALYZE_RESPONSE_SCHEMA,
+    schemaName: 'lemma_analysis',
+    maxOutputTokens: 1200,
+    temperature: prompt.temperature,
+  });
   return { result: payload.parsed as AnalyzeAiResult, inputTokens: payload.inputTokens, outputTokens: payload.outputTokens };
 }
 
 async function callSeedDictionaryOpenAI(lemma: string, model: string): Promise<{ result: SeedDictionarySense[]; inputTokens: number; outputTokens: number }> {
-  const payload = await callOpenAIJsonSchema(
-    SEED_DICTIONARY_SYSTEM_PROMPT,
-    buildSeedDictionaryUserPrompt(lemma),
+  const payload = await callOpenAIJsonSchema({
+    apiKey: OPENAI_API_KEY!,
+    systemPrompt: SEED_DICTIONARY_SYSTEM_PROMPT,
+    userPrompt: buildSeedDictionaryUserPrompt(lemma),
     model,
-    SEED_DICTIONARY_RESPONSE_SCHEMA,
-    'seed_dictionary',
-    2500
-  );
-  return { result: (payload.parsed as { senses: SeedDictionarySense[] }).senses, inputTokens: payload.inputTokens, outputTokens: payload.outputTokens };
-}
-
-async function callOpenAIJsonSchema(
-  systemPrompt: string,
-  userPrompt: string,
-  model: string,
-  schema: unknown,
-  schemaName: string,
-  maxOutputTokens: number
-): Promise<{ parsed: unknown; inputTokens: number; outputTokens: number }> {
-  const response = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model,
-      max_tokens: maxOutputTokens,
-      response_format: { type: 'json_schema', json_schema: { name: schemaName, strict: true, schema } },
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: userPrompt },
-      ],
-    }),
+    schema: SEED_DICTIONARY_RESPONSE_SCHEMA,
+    schemaName: 'seed_dictionary',
+    maxOutputTokens: 2500,
   });
-
-  if (!response.ok) {
-    const errorBody = await response.text().catch(() => '');
-    throw new Error(`openai_http_${response.status}: ${errorBody.slice(0, 500)}`);
-  }
-
-  const result = await response.json();
-  const choice = result.choices?.[0];
-  const content = choice?.message?.content;
-  if (!content) throw new Error('openai_empty_response');
-  if (choice?.finish_reason && choice.finish_reason !== 'stop') {
-    throw new Error(`output_truncated: finish_reason=${choice.finish_reason}, length=${content.length}`);
-  }
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(content);
-  } catch {
-    throw new Error(`invalid_json: length=${content.length}`);
-  }
-
-  return {
-    parsed,
-    inputTokens: result.usage?.prompt_tokens ?? 0,
-    outputTokens: result.usage?.completion_tokens ?? 0,
-  };
+  return { result: (payload.parsed as { senses: SeedDictionarySense[] }).senses, inputTokens: payload.inputTokens, outputTokens: payload.outputTokens };
 }

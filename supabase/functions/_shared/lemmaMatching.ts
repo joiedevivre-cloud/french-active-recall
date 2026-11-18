@@ -95,3 +95,68 @@ export function shouldPreserveField(userEditedFields: string[] | null | undefine
 export function shouldRetryAfterSchemaFailure(attempt: number, maxAttempts: number): boolean {
   return attempt < maxAttempts;
 }
+
+// -----------------------------------------------------------------------------
+// Reflexive "mettre" guard (prompt management, stage 1 validation).
+//
+// NOT the same rule as resolveExistingUsageId above (that one compares an
+// AI-suggested usage's stored pattern with the recognized pattern). This one
+// looks at the SENTENCE itself: when it contains a reflexive construction of
+// mettre (je me mets / je me suis mise / tu te mets / il se met / nous nous
+// mettons / vous vous êtes mis / mets-toi ...), the assigned usage pattern
+// must be a "se mettre" construction -- a basic-meaning usage (놓다/입다/켜다)
+// is a misclassification (the "Je me suis mise à chercher" -> "기기를 켜다" bug).
+//
+// The pronoun must agree with the subject to count as reflexive, so object
+// pronouns are not flagged: "Il me met en colère", "Je te mets au courant".
+// -----------------------------------------------------------------------------
+
+const METTRE_FORM_RE = /^(mett\w*|mets|met|mis|mise|mises|mit|mirent)$/;
+const ETRE_AUX = new Set([
+  'suis', 'es', 'est', 'sommes', 'etes', 'sont', 'etais', 'etait', 'etions', 'etiez', 'etaient',
+  'serai', 'seras', 'sera', 'serons', 'serez', 'seront', 'serais', 'serait', 'serions', 'seriez', 'seraient',
+  'sois', 'soit', 'soyons', 'soyez', 'soient', 'etre', 'etant', 'ete',
+]);
+const NEGATION = new Set(['pas', 'jamais', 'plus', 'point', 'rien', 'guere']);
+const SUBJECT_FOR_PRONOUN: Record<string, string> = { me: 'je', te: 'tu', nous: 'nous', vous: 'vous' };
+
+function tokenizeFrench(sentence: string): string[] {
+  return sentence
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[̀-ͯ]/g, '')
+    .replace(/[’`]/g, "'")
+    .replace(/\b([mtsjnl])'/g, (_, c: string) => (c === 'l' ? 'le ' : `${c}e `))
+    .split(/[^a-z]+/)
+    .filter(Boolean);
+}
+
+export function hasReflexiveMettre(sentence: string): boolean {
+  const lowered = sentence.toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '');
+  // Imperative: mets-toi, mettez-vous, mettons-nous
+  if (/\bmet\w*-(toi|vous|nous)\b/.test(lowered)) return true;
+
+  const tokens = tokenizeFrench(sentence);
+  for (let i = 0; i < tokens.length; i++) {
+    if (!METTRE_FORM_RE.test(tokens[i])) continue;
+    let j = i - 1;
+    while (j >= 0 && NEGATION.has(tokens[j])) j--;
+    if (j >= 0 && ETRE_AUX.has(tokens[j])) j--;
+    if (j < 0) continue;
+    const pronoun = tokens[j];
+    if (pronoun === 'se') return true;
+    const subject = SUBJECT_FOR_PRONOUN[pronoun];
+    if (!subject) continue;
+    let k = j - 1;
+    if (k >= 0 && tokens[k] === 'ne') k--;
+    if (k >= 0 && tokens[k] === subject) return true;
+  }
+  return false;
+}
+
+/** true = the sentence uses reflexive mettre but the assigned usage is not a "se mettre" construction. */
+export function isReflexiveMettreMisassigned(sentence: string, lemma: string, usagePattern: string): boolean {
+  if (!normalizePattern(lemma).includes('mettre')) return false;
+  if (!hasReflexiveMettre(sentence)) return false;
+  return !normalizePattern(usagePattern).includes('se mettre');
+}
