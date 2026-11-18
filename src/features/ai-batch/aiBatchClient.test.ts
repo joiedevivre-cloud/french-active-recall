@@ -74,11 +74,37 @@ describe('analyzeChunk', () => {
     expect(result.results?.[0].expression_fr).toBe('Je pense à lui.');
   });
 
-  it('fails when the server returns an error', async () => {
-    invokeMock.mockResolvedValue({ data: null, error: { message: 'daily_limit_exceeded' } });
+  it('fails when the server returns an error, reading the real status/body instead of the generic message', async () => {
+    const response = new Response(JSON.stringify({ error: 'daily_limit_exceeded' }), {
+      status: 429,
+      headers: { 'content-type': 'application/json' },
+    });
+    invokeMock.mockResolvedValue({
+      data: null,
+      error: { message: 'Edge Function returned a non-2xx status code' },
+      response,
+    });
     const result = await analyzeChunk(['a']);
     expect(result.status).toBe('failed');
-    expect(result.error).toBe('daily_limit_exceeded');
+    expect(result.error).toBe('HTTP 429: daily_limit_exceeded');
+  });
+
+  it('falls back to a network_error label when invoke fails with no response at all', async () => {
+    invokeMock.mockResolvedValue({ data: null, error: { message: 'fetch failed' }, response: undefined });
+    const result = await analyzeChunk(['a']);
+    expect(result.status).toBe('failed');
+    expect(result.error).toContain('network_error');
+  });
+
+  it('redacts anything that looks like an API key in the error body', async () => {
+    const response = new Response(JSON.stringify({ message: 'bad key sk-abcdefghijklmnop' }), {
+      status: 500,
+      headers: { 'content-type': 'application/json' },
+    });
+    invokeMock.mockResolvedValue({ data: null, error: { message: 'non-2xx' }, response });
+    const result = await analyzeChunk(['a']);
+    expect(result.error).not.toContain('sk-abcdefghijklmnop');
+    expect(result.error).toContain('[REDACTED]');
   });
 
   it('fails when the result count does not match the input count', async () => {

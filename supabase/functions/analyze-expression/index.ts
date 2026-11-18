@@ -145,6 +145,7 @@ Deno.serve(async (req) => {
     const { id: usageLogId } = await logUsage(admin, userId, 'reserved', null, model);
 
     if (!OPENAI_API_KEY) {
+      console.error('[analyze-expression] OPENAI_API_KEY is not set (check: supabase secrets list)');
       await admin.from('ai_usage_log').update({ status: 'failed', rejection_reason: 'openai_key_not_configured' }).eq('id', usageLogId);
       await admin.from('expressions').update({ ai_analysis_status: 'failed' }).eq('id', expressionId);
       return jsonResponse({ error: 'openai_key_not_configured' }, 500);
@@ -159,12 +160,13 @@ Deno.serve(async (req) => {
       inputTokens = completion.inputTokens;
       outputTokens = completion.outputTokens;
     } catch (err) {
+      console.error('[analyze-expression] openai_call_failed', err instanceof Error ? err.stack ?? err.message : err);
       await admin
         .from('ai_usage_log')
         .update({ status: 'failed', rejection_reason: String(err) })
         .eq('id', usageLogId);
       await admin.from('expressions').update({ ai_analysis_status: 'failed' }).eq('id', expressionId);
-      return jsonResponse({ error: 'openai_call_failed' }, 502);
+      return jsonResponse({ error: 'openai_call_failed', message: String(err) }, 502);
     }
 
     const estimatedCost = (inputTokens / 1_000_000) * pricing.input + (outputTokens / 1_000_000) * pricing.output;
@@ -202,6 +204,15 @@ Deno.serve(async (req) => {
     });
 
     return jsonResponse({ ok: true, analysis });
+  } catch (err) {
+    // Without this, any unexpected throw here propagated uncaught out of
+    // the handler after `finally` ran, and Deno's edge runtime returned a
+    // generic 502 "EDGE_FUNCTION_ERROR" with no application log at all
+    // (confirmed happening to analyze-batch's identical try/finally before
+    // this fix). Logging here never includes the request body or the
+    // OpenAI key -- just the error itself.
+    console.error('[analyze-expression] unhandled error', err instanceof Error ? err.stack ?? err.message : err);
+    return jsonResponse({ error: 'internal_error', message: '예상치 못한 서버 오류가 발생했습니다.' }, 500);
   } finally {
     // Always release the concurrency lock, even on an early return/throw above.
     await admin.from('ai_active_requests').delete().eq('user_id', userId);
@@ -250,7 +261,8 @@ lemma (base/dictionary form in French), meaning_ko (Korean meaning), definition_
   });
 
   if (!response.ok) {
-    throw new Error(`openai_http_${response.status}`);
+    const errorBody = await response.text().catch(() => '');
+    throw new Error(`openai_http_${response.status}: ${errorBody.slice(0, 500)}`);
   }
 
   const payload = await response.json();

@@ -37,9 +37,9 @@ export function chunkSentences(sentences: string[], size: number = CHUNK_SIZE): 
  */
 export async function analyzeChunk(sentences: string[]): Promise<AiBatchChunkResult> {
   try {
-    const { data, error } = await supabase.functions.invoke('analyze-batch', { body: { sentences } });
+    const { data, error, response } = await supabase.functions.invoke('analyze-batch', { body: { sentences } });
     if (error) {
-      return { sentences, status: 'failed', error: error.message };
+      return { sentences, status: 'failed', error: await describeInvokeError(response) };
     }
     if (!data?.ok || !Array.isArray(data.results)) {
       return { sentences, status: 'failed', error: data?.error ?? 'invalid_response' };
@@ -51,6 +51,37 @@ export async function analyzeChunk(sentences: string[]): Promise<AiBatchChunkRes
   } catch (err) {
     return { sentences, status: 'failed', error: err instanceof Error ? err.message : 'unknown_error' };
   }
+}
+
+/**
+ * supabase-js's invoke() error.message is always the generic "Edge Function
+ * returned a non-2xx status code" -- the ACTUAL status code and response
+ * body only live on the separate `response` field it returns alongside
+ * `error` (see @supabase/functions-js FunctionsClient.invoke, which throws
+ * FunctionsHttpError(response) and then unwraps response back out of
+ * error.context for this exact purpose). This reads the real status/body so
+ * a 401/429/500/etc. shows up as something a user or developer can act on,
+ * instead of the one generic sentence every failure used to show.
+ */
+async function describeInvokeError(response: Response | undefined): Promise<string> {
+  if (!response) return 'network_error (no response reached the server)';
+  let bodyText = '';
+  try {
+    const cloned = response.clone();
+    const contentType = cloned.headers.get('content-type') ?? '';
+    if (contentType.includes('application/json')) {
+      const body = await cloned.json();
+      bodyText = typeof body === 'string' ? body : body?.message ?? body?.error ?? JSON.stringify(body);
+    } else {
+      bodyText = (await cloned.text()).slice(0, 300);
+    }
+  } catch {
+    bodyText = '(response body could not be read)';
+  }
+  // Defensive: never surface anything that looks like a secret key, even
+  // though this app's Edge Functions never put one in a response body.
+  const redacted = bodyText.replace(/sk-[A-Za-z0-9_-]{10,}/g, '[REDACTED]');
+  return `HTTP ${response.status}: ${redacted}`;
 }
 
 /**

@@ -116,11 +116,20 @@ export default function LibraryPage() {
     },
   });
 
+  const [lastRetryError, setLastRetryError] = useState<{ id: string; message: string } | null>(null);
+
   const retryAnalysis = useMutation({
     mutationFn: async (expr: ExpressionRow) => {
+      setLastRetryError(null);
       await supabase.from('expressions').update({ ai_analysis_status: 'pending' }).eq('id', expr.id);
       invalidate();
       const result = await analyzeChunk([expr.expression_fr]);
+      if (result.status === 'failed') {
+        // Surfaces the real HTTP status/body from the Edge Function (see
+        // describeInvokeError in aiBatchClient.ts) instead of the generic
+        // "non-2xx status code" message every failure used to show.
+        setLastRetryError({ id: expr.id, message: result.error ?? 'unknown_error' });
+      }
       await applyAnalysisResult(expr.id, result.status === 'success' ? result.results?.[0] ?? null : null);
     },
     onSettled: invalidate,
@@ -210,16 +219,21 @@ export default function LibraryPage() {
                 ) : expr.meaning_ko ? (
                   <p className="mt-0.5 text-sm text-slate-500">{expr.meaning_ko}</p>
                 ) : expr.ai_analysis_status === 'failed' ? (
-                  <p className="mt-0.5 flex items-center gap-2 text-sm text-red-500">
-                    분석 실패
-                    <button
-                      onClick={() => retryAnalysis.mutate(expr)}
-                      disabled={retryAnalysis.isPending}
-                      className="rounded-full border border-red-400 px-2 py-0.5 text-xs disabled:opacity-40"
-                    >
-                      재시도
-                    </button>
-                  </p>
+                  <div className="mt-0.5">
+                    <p className="flex items-center gap-2 text-sm text-red-500">
+                      분석 실패
+                      <button
+                        onClick={() => retryAnalysis.mutate(expr)}
+                        disabled={retryAnalysis.isPending}
+                        className="rounded-full border border-red-400 px-2 py-0.5 text-xs disabled:opacity-40"
+                      >
+                        재시도
+                      </button>
+                    </p>
+                    {lastRetryError?.id === expr.id && (
+                      <p className="mt-1 text-xs text-red-400">{lastRetryError.message}</p>
+                    )}
+                  </div>
                 ) : (
                   <p className="mt-0.5 text-sm text-slate-400">AI 분석 중...</p>
                 )}

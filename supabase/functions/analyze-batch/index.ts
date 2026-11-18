@@ -113,6 +113,7 @@ Deno.serve(async (req) => {
   // 1. Global kill switch.
   const { data: config } = await admin.from('ai_system_config').select('*').eq('id', true).single();
   if (!config?.ai_enabled) {
+    console.warn('[analyze-batch] rejected: ai_disabled');
     return jsonResponse({ error: 'ai_disabled', message: 'AI 기능이 현재 일시 중지되어 있습니다.' }, 503);
   }
 
@@ -120,13 +121,17 @@ Deno.serve(async (req) => {
   await admin.rpc('sweep_stale_ai_locks', { p_max_age_seconds: 120 });
   const { error: lockError } = await admin.from('ai_active_requests').insert({ user_id: userId });
   if (lockError) {
+    console.warn('[analyze-batch] rejected: concurrent_request_limit', lockError.message);
     return jsonResponse({ error: 'concurrent_request_limit', message: '이전 요청이 아직 처리중입니다.' }, 429);
   }
 
   try {
     // 3. Per-user rate limits + today's usage (chunk counts as `sentences.length` analyses).
     const { data: limits } = await admin.from('ai_rate_limits').select('*').eq('user_id', userId).single();
-    if (!limits) return jsonResponse({ error: 'rate_limits_not_provisioned' }, 500);
+    if (!limits) {
+      console.error('[analyze-batch] rate_limits_not_provisioned for user', userId);
+      return jsonResponse({ error: 'rate_limits_not_provisioned' }, 500);
+    }
 
     for (const sentence of sentences) {
       if (sentence.length > limits.max_input_chars) {
@@ -145,6 +150,7 @@ Deno.serve(async (req) => {
     const analysesToday = usage?.expression_analyses_count ?? 0;
     if (analysesToday + sentences.length > limits.daily_expression_analyses) {
       await logUsage(admin, userId, 'rejected', 'daily_limit_exceeded');
+      console.warn('[analyze-batch] rejected: daily_limit_exceeded', { analysesToday, requested: sentences.length, limit: limits.daily_expression_analyses });
       return jsonResponse({ error: 'daily_limit_exceeded', remaining: Math.max(0, limits.daily_expression_analyses - analysesToday) }, 429);
     }
 
@@ -152,6 +158,7 @@ Deno.serve(async (req) => {
     const dailyCost = usage?.estimated_cost_usd ?? 0;
     if (dailyCost >= config.daily_budget_usd) {
       await logUsage(admin, userId, 'rejected', 'daily_budget_exceeded');
+      console.warn('[analyze-batch] rejected: daily_budget_exceeded', { dailyCost, limit: config.daily_budget_usd });
       return jsonResponse({ error: 'daily_budget_exceeded' }, 429);
     }
     const month = `${today.slice(0, 7)}-01`;
@@ -163,6 +170,7 @@ Deno.serve(async (req) => {
       .maybeSingle();
     if ((monthlyUsage?.estimated_cost_usd ?? 0) >= config.monthly_budget_usd) {
       await logUsage(admin, userId, 'rejected', 'monthly_budget_exceeded');
+      console.warn('[analyze-batch] rejected: monthly_budget_exceeded');
       return jsonResponse({ error: 'monthly_budget_exceeded' }, 429);
     }
 
@@ -172,6 +180,7 @@ Deno.serve(async (req) => {
     const { id: usageLogId } = await logUsage(admin, userId, 'reserved', null, model);
 
     if (!OPENAI_API_KEY) {
+      console.error('[analyze-batch] OPENAI_API_KEY is not set (check: supabase secrets list)');
       await admin.from('ai_usage_log').update({ status: 'failed', rejection_reason: 'openai_key_not_configured' }).eq('id', usageLogId);
       return jsonResponse({ error: 'openai_key_not_configured' }, 500);
     }
@@ -192,6 +201,7 @@ Deno.serve(async (req) => {
         throw new Error(`result_count_mismatch: expected ${sentences.length}, got ${results.length}`);
       }
     } catch (err) {
+      console.error('[analyze-batch] openai_call_failed', err instanceof Error ? err.stack ?? err.message : err);
       await admin
         .from('ai_usage_log')
         .update({ status: 'failed', rejection_reason: String(err) })
@@ -213,6 +223,17 @@ Deno.serve(async (req) => {
     });
 
     return jsonResponse({ ok: true, results });
+  } catch (err) {
+    // Without this catch, ANY unexpected throw here (not just the
+    // anticipated OpenAI-call failure above) propagated uncaught out of
+    // the handler after `finally` ran -- Deno's edge runtime then returns
+    // a generic 502 "EDGE_FUNCTION_ERROR" with no application log at all,
+    // which is exactly what was observed in production. Logging here (no
+    // request body, no API key -- just the error itself) makes the next
+    // occurrence visible in Dashboard -> Edge Functions -> Logs instead of
+    // an opaque 502.
+    console.error('[analyze-batch] unhandled error', err instanceof Error ? err.stack ?? err.message : err);
+    return jsonResponse({ error: 'internal_error', message: '예상치 못한 서버 오류가 발생했습니다.' }, 500);
   } finally {
     await admin.from('ai_active_requests').delete().eq('user_id', userId);
   }
@@ -274,7 +295,12 @@ Return exactly ${sentences.length} result objects, one per input sentence, in in
   });
 
   if (!response.ok) {
-    throw new Error(`openai_http_${response.status}`);
+    // Include OpenAI's own error body (never the API key -- that's only
+    // ever sent in the outgoing request header, never present in any
+    // response) so "model not found" / invalid schema / quota errors are
+    // distinguishable from each other instead of just a bare status code.
+    const errorBody = await response.text().catch(() => '');
+    throw new Error(`openai_http_${response.status}: ${errorBody.slice(0, 500)}`);
   }
 
   const payload = await response.json();
