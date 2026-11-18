@@ -68,6 +68,43 @@ export default function SettingsPage() {
         />
       </div>
 
+      <div>
+        <label className="text-sm text-slate-500">하루 작문 연습 목표: {settings.daily_writing_target}개</label>
+        <input
+          type="range"
+          min={0}
+          max={30}
+          value={settings.daily_writing_target}
+          onChange={(e) => updateSettings({ daily_writing_target: Number(e.target.value) })}
+          className="w-full"
+        />
+      </div>
+
+      <div>
+        <label className="text-sm text-slate-500">하루 말하기 연습 목표: {settings.daily_speaking_target}개</label>
+        <input
+          type="range"
+          min={0}
+          max={30}
+          value={settings.daily_speaking_target}
+          onChange={(e) => updateSettings({ daily_speaking_target: Number(e.target.value) })}
+          className="w-full"
+        />
+      </div>
+
+      <div>
+        <label className="text-sm text-slate-500">목표 기억 유지율: {Math.round(settings.desired_retention * 100)}%</label>
+        <input
+          type="range"
+          min={70}
+          max={97}
+          value={Math.round(settings.desired_retention * 100)}
+          onChange={(e) => updateSettings({ desired_retention: Number(e.target.value) / 100 })}
+          className="w-full"
+        />
+        <p className="mt-1 text-xs text-slate-400">높을수록 복습 간격이 짧아지고 더 자주 복습합니다 (FSRS 설정값).</p>
+      </div>
+
       <div className="mt-4 border-t border-slate-200 pt-4 dark:border-slate-800">
         <p className="text-sm text-slate-400">{user?.email}</p>
         <button onClick={() => void signOut()} className="mt-2 text-sm text-red-500">

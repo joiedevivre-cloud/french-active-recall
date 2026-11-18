@@ -223,6 +223,60 @@ Vitest 양쪽에서 같은 파일 import, `lemmaMatching.ts`와 동일 패턴).
 2번(상세 분석은 버튼을 눌러야만 발생하는 3번째 호출). 일일 한도
 (`ai_rate_limits.daily_expression_analyses`)로 과금은 제한되어 있음.
 
+## 능동적 작문 훈련 + FSRS 장기 기억 시스템
+
+표현을 "인식"하는 것에서 "직접 문장을 만들고 AI 교정을 받고 장기적으로
+기억"하는 것으로 학습을 발전시키는 기능. **FSRS 간격 반복은 이미 실제로
+구현되어 있었음**(`ts-fsrs` 4.7.1, `src/lib/fsrs.ts`, `review_states`/
+`review_attempts`, 지난 세션에 완성) — 이번 작업은 그걸 재사용/확장한
+것이고 새 병렬 SRS 시스템을 만들지 않았다.
+
+- **원자성/멱등성**: `TodayReview.tsx`가 예전엔 `review_states.update()` →
+  `review_attempts.insert()` 두 번의 비트랜잭션 쓰기를 했음(네트워크
+  재시도 시 FSRS 복습 횟수가 중복 집계될 수 있었음). 새 RPC
+  `confirm_review_grade`(`security invoker`, `client_id` 멱등성 키)로
+  하나의 원자적 호출로 교체(`src/features/review/confirmReviewGrade.ts`).
+  FSRS 계산 자체는 여전히 클라이언트(`scheduleReview`)에서 하고, RPC는
+  그 결과만 저장 — `ts-fsrs` 로직을 SQL로 포팅하지 않음.
+- **목표 기억 유지율**: `user_settings.desired_retention`(기본 0.9) →
+  `scheduleReview(row, rating, now, requestRetention)` 옵션 파라미터로
+  연결(생략 시 기존 0.9 동작 그대로, 하위 호환). 설정 화면에서 조정 가능.
+- **회상 가능성(retrievability)**: `review_states.last_retrievability`에
+  매 복습 시점 스냅샷 저장(`ts-fsrs`의 `get_retrievability()` 실사용, 직접
+  만든 공식 아님). "마지막 복습 시점 기준" 추정치라고 명시 — 실시간 값이
+  필요하면 `estimateCurrentRetrievability()`(`fsrs.ts`)를 그 카드만 계산.
+- **4가지 작문/말하기 모드**: 문장 변형(`TransformCard`)/한→불 작문
+  (`KoreanPromptCard`)/실생활 상황별 작문(`SituationalCard`)/말하기
+  (`SpeakingCard`, Web Speech API `SpeechRecognition` 기능 감지, 미지원
+  브라우저는 텍스트 입력만 — **발음 점수는 만들지 않음**, 스키마에 그런
+  필드 자체가 없음). 공통 제출/교정/등급 흐름은 `WritingCardShell.tsx`로
+  추출.
+- **신규 Edge Function `writing-practice`**(`action: 'generate'|'correct'`,
+  `analyze-batch`/`analyze-lemma`와 동일한 보안/예산 스캐폴드를 복사 —
+  로직 공유 없음, 버그 전파 방지): `generate`는 `writing_exercises` 캐시
+  히트 시 **AI 호출 0회**(미사용 문제가 있으면 재사용, 전부 사용됐으면
+  새 변형 생성 — "잊은 표현은 같은 문법으로 새 문장" 요구사항을 이 캐시/
+  풀 구조로 만족), `correct`는 의미/문법/어휘·전치사/시제 오류를 구조화된
+  JSON으로 반환하고 **AI 추천 등급**(`grammar_errors`/`meaning_ok`에서
+  결정적으로 계산, AI에게 직접 등급을 받지 않음 — 더 일관됨)을 돌려주되
+  **사용자가 확정한 등급(`self_rating`)만 FSRS에 반영**됨(둘은 DB에서도
+  별개 컬럼). 교정 실패 시 입력한 답변은 화면에 그대로 남아 재시도 가능.
+- **문법별 약점 추적**: `grammar_skills`(태그별 정답률/최근 오류) — **FSRS
+  스케줄을 절대 건드리지 않음**, "오늘의 학습" 큐 구성에서 가중치로만 씀.
+  교정 결과마다 `record_grammar_attempt` RPC로 기록(FSRS 등급과 무관).
+- **오늘의 학습 큐**(`src/features/today/buildTodayQueue.ts`, 순수 함수):
+  기한초과(더 지난 것 우선) > 최근오답 > 안정성낮음 순으로 정렬 후
+  `daily_review_limit`/`daily_new_limit`으로 **타입별** 자르기(전체
+  백로그 강제 안 함, 못 들어간 개수는 화면에 "내일 이어서" 표시).
+  작문/말하기 슬롯은 이 캡 걸린 풀에서 **추가가 아니라 할당**되어(같은
+  카드가 복습+작문 양쪽으로 중복 집계되지 않음) 약한 문법 태그 우선.
+- **대시보드**(`/dashboard`): 오늘 완료/남음, 다음 복습, 최근 7일 기록,
+  문법별 숙련도, 예상 기억 유지율(**"FSRS 추정값" 명시**, 실측 아님).
+- **실제 버그 발견 및 수정**: `ai_usage_log.feature` CHECK 제약이
+  `analyze-lemma`가 쓰는 `'lemma_analysis'`를 허용 안 해서 그 감사 로그
+  insert가 조용히 실패하고 있었음(`increment_ai_usage`는 별도 RPC라
+  과금 집계 자체는 정상 동작). 이번 마이그레이션에서 같이 고침.
+
 ## 데이터베이스 마이그레이션
 
 `supabase/migrations/`에 번호 순서로 들어있다. **검토 후 Supabase SQL
@@ -243,6 +297,19 @@ Editor(또는 `supabase db push`)에서 직접 실행한다 — 자동으로 적
 12. `0012_fix_max_output_tokens.sql` — **중요 버그 수정**: `ai_rate_limits.max_output_tokens` 기본값이 1024라서 15~20문장 배치 분석 시 OpenAI 응답이 중간에 끊겨 "Unterminated string in JSON" 오류가 났음. 기본값을 4000으로 올림(기존 행도 갱신) — `analyze-batch` 코드가 이 값을 상한으로 쓰는 동적 토큰 계산을 하므로, 이 마이그레이션 없이는 코드 수정도 무력화됨
 13. `0013_detailed_analysis.sql` — 표현 상세 화면용 구조화 분석 저장: `expressions.detailed_analysis`(jsonb)/`analyzed_at`/`analysis_version`/`analysis_requested_at`/`meaning_ko_user_edited` 추가, `ai_analysis_status`에 `'analyzing'` 상태 추가(요청없음=pending과 실제진행중=analyzing을 구분, 전부 추가적 변경이라 기존 데이터 영향 없음)
 14. `0014_lemma_vocabulary.sql` — **신규 기능(단어장)**: `lemmas`/`lemma_usages`/`expression_analysis` 3개 테이블 + RLS + 인덱스 전부 새로 생성. 기존 테이블은 전혀 건드리지 않음(순수 추가)
+15. `0015_writing_practice.sql` — **신규 기능(작문 훈련/FSRS 확장)**:
+    `ai_usage_log.feature` CHECK 버그 수정(`lemma_analysis`/`writing_practice`
+    추가), 신규 `writing_exercises`/`grammar_skills` 테이블, `review_attempts`에
+    `ai_suggested_rating`/`exercise_id`/`grammar_tags`/`client_id`(멱등성)/
+    `mode` 컬럼 추가(+ `attempt_type`에 `writing`/`speaking` 추가),
+    `review_states.last_retrievability` 추가, `user_settings`에
+    `daily_writing_target`/`daily_speaking_target`/`desired_retention`
+    추가, `ai_rate_limits`/`ai_daily_usage`에 작문 전용 카운터 추가,
+    `increment_ai_usage` 재생성(옵션 파라미터 2개 추가, 기존 호출부
+    무변경), 신규 RPC `record_grammar_attempt`/`confirm_review_grade`
+    (둘 다 `security invoker`). 기존 테이블 삭제/이름변경 없음, 전부
+    nullable/default 컬럼 추가이거나 CHECK 제약을 상위집합으로 넓히는
+    것뿐
 
 ## Edge Function 배포
 
@@ -251,6 +318,7 @@ supabase link --project-ref xwbcpanispdyrchddnzi
 supabase functions deploy analyze-expression
 supabase functions deploy analyze-batch
 supabase functions deploy analyze-lemma
+supabase functions deploy writing-practice
 supabase secrets set OPENAI_API_KEY=sk-...   # 터미널에만 직접 입력. 채팅/코드에 쓰지 않기.
 ```
 
@@ -263,7 +331,7 @@ Switch)를 통과하기 전에는 실제 OpenAI 키를 연결하지 않는다.**
 
 ## 사용자가 직접 해야 하는 설정 (Claude Code가 대신 할 수 없는 작업)
 
-1. **Supabase 마이그레이션 적용**: 위 14개 SQL을 순서대로 SQL Editor에서 실행 (`0014`가 새로 추가됨, 아직 미실행이면 검토 후 적용)
+1. **Supabase 마이그레이션 적용**: 위 15개 SQL을 순서대로 SQL Editor에서 실행 (`0015`가 새로 추가됨, 아직 미실행이면 검토 후 적용)
 2. **Google OAuth**:
    - Google Cloud Console에서 OAuth 클라이언트 생성, 승인된 리디렉션 URI에
      `https://xwbcpanispdyrchddnzi.supabase.co/auth/v1/callback` 등록
@@ -294,6 +362,12 @@ Switch)를 통과하기 전에는 실제 OpenAI 키를 연결하지 않는다.**
     6. `Je ne savais pas qu'il fallait remplir ce formulaire.`
     7. `J'aurais aimé être prévenue plus tôt.`
     8. `Il faut que nous mettions nos idées en commun.`
+11. **작문 훈련 배포**: `0015` 마이그레이션 실행 후
+    `supabase functions deploy writing-practice --remote=xwbcpanispdyrchddnzi`.
+    `/today`에서 4가지 모드(문장변형/한불작문/상황작문/말하기) 실제로
+    돌려보고 AI 교정/추천 등급/대시보드 수치 확인 — 로그인 세션이 없어
+    제가 실제 호출 불가(기존과 동일 제약). 설정 화면에서 하루 작문/말하기
+    목표와 목표 기억 유지율 원하는 값으로 조정
 
 ## 테스트 결과
 
@@ -301,8 +375,30 @@ Switch)를 통과하기 전에는 실제 OpenAI 키를 연결하지 않는다.**
 
 - `npm run typecheck` — 통과
 - `npm run build` — 통과 (더미 env로 로컬 빌드, 번들에 비밀키 누출 없음 확인)
-- `npm test` (`vitest`) — **115개 테스트 통과** (전부 모킹 기반, 실제 OpenAI/Supabase 네트워크 호출 없음)
-  - `detailedAnalysisSchema.test.ts` (8개, 신규): `analyze-batch`가 실제로
+- `npm test` (`vitest`) — **152개 테스트 통과** (전부 모킹 기반, 실제 OpenAI/Supabase 네트워크 호출 없음)
+  - `fsrs.test.ts` (8개, 신규): `ts-fsrs` 실제 동작 검증(재구현 아님) —
+    신규 카드+good→learning, 복습카드+again→relearning/lapses 증가,
+    `requestRetention` 생략 시 기존 0.9 동작과 100% 동일, 낮은 목표
+    유지율일수록 더 긴 간격, `last_retrievability` 스냅샷이 (0,1] 범위,
+    `estimateCurrentRetrievability`가 시간 지날수록 감소
+  - `confirmReviewGrade.test.ts` (4개): RPC에 멱등성 `client_id` 전달,
+    중복 제출 시 `alreadyApplied:true` 응답 처리, RPC 에러 전파, 기본값
+  - `writingPractice.test.ts` (11개): `writing-practice`가 실제로 쓰는
+    `supabase/functions/_shared/writingPractice.ts`를 그대로 import —
+    캐시 히트(미사용 문제 존재)→AI 호출 스킵, 전부 사용됐으면 캐시
+    미스(새 변형 생성), `forceNew`, 그래머 태그 정제(trim/dedupe/비문자열
+    제거), 교정 결과→추천 등급 결정 로직(의미 틀림→again, 오류 있음→
+    hard, 깨끗함→good까지만 — easy는 자동 추천 안 함)
+  - `buildTodayQueue.test.ts` (9개): 기한초과 정렬(더 지난 것 우선),
+    같은 지난 정도 안에서 최근오답/낮은안정성 순, 신규는 항상 뒤+별도
+    정렬, `dailyReviewLimit`/`dailyNewLimit` 독립적 캡 및 못 들어간
+    개수 보고, **작문/말하기 슬롯이 추가가 아니라 캡 걸린 풀에서
+    할당됨(중복 집계 없음)**, 약한 문법 태그 우선 배정 및 태그 없을 때
+    폴백
+  - `speechInput.test.ts` (5개): `SpeechRecognition`/`webkitSpeechRecognition`
+    기능 감지, 미지원 시 에러 콜백+null 반환(throw 안 함), 지원 시
+    start/stop 호출
+  - `detailedAnalysisSchema.test.ts` (8개): `analyze-batch`가 실제로
     쓰는 `supabase/functions/_shared/detailedAnalysisSchema.ts`를 그대로
     import — strict 스키마 모양(필수필드=전체 property, `additionalProperties:
     false`), v2 `core_pattern` 필드 존재/nullable, v1 필드 전부 보존,
@@ -354,6 +450,15 @@ Switch)를 통과하기 전에는 실제 OpenAI 키를 연결하지 않는다.**
   모양만 테스트했고, 지시서의 8문장으로 실제 분석 품질(핵심 패턴/문법
   설명 정확도)은 **사용자가 직접 확인해야 함**(아래 "사용자가 할 일"
   10번). 스키마 통과 ≠ 분석 내용 정확성.
+- **`writing-practice` Edge Function(작문 훈련)은 전혀 호출된 적
+  없음** — 배포 자체도 아직 안 함(사용자가 할 일 11번). `confirm_review_grade`/
+  `record_grammar_attempt` RPC도 마이그레이션 0015를 실행해야 생기므로
+  미검증. `/today` 화면의 실제 흐름(문제 생성→작문→AI 교정→등급 확정→
+  대시보드 반영)은 **사용자가 직접 확인 필요** — 로그인 세션이 없어
+  제가 직접 호출 불가(기존과 동일 제약).
+- **Web Speech API(말하기 연습)는 실제 브라우저에서 테스트 안 됨** —
+  기능 감지 분기만 Vitest로 확인, 실제 마이크 권한/인식 정확도는
+  브라우저/OS마다 다르고 자동화 불가.
 
 ### 수동 (사용자 환경에서만 가능 — 미검증)
 

@@ -62,9 +62,9 @@ export default function HomePage() {
           <div className="text-2xl">🎓</div>
           <div className="mt-1 text-sm font-medium">수업 모드</div>
         </Link>
-        <Link to="/review" className="rounded-2xl border border-slate-200 p-4 text-center dark:border-slate-800">
+        <Link to="/today" className="rounded-2xl border border-slate-200 p-4 text-center dark:border-slate-800">
           <div className="text-2xl">🔁</div>
-          <div className="mt-1 text-sm font-medium">빠른 복습 시작</div>
+          <div className="mt-1 text-sm font-medium">오늘의 학습</div>
         </Link>
         <Link to="/ai-chat" className="rounded-2xl border border-slate-200 p-4 text-center dark:border-slate-800">
           <div className="text-2xl">💬</div>
@@ -73,6 +73,10 @@ export default function HomePage() {
         <Link to="/library" className="rounded-2xl border border-slate-200 p-4 text-center dark:border-slate-800">
           <div className="text-2xl">📚</div>
           <div className="mt-1 text-sm font-medium">전체 표현장</div>
+        </Link>
+        <Link to="/dashboard" className="rounded-2xl border border-slate-200 p-4 text-center dark:border-slate-800">
+          <div className="text-2xl">📊</div>
+          <div className="mt-1 text-sm font-medium">학습 대시보드</div>
         </Link>
       </div>
 

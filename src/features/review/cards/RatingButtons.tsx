@@ -7,16 +7,25 @@ const BUTTONS: { rating: DbRating; label: string; className: string }[] = [
   { rating: 'easy', label: '쉬움 (Easy)', className: 'bg-blue-600' },
 ];
 
-export function RatingButtons({ onRate }: { onRate: (rating: DbRating) => void }) {
+interface RatingButtonsProps {
+  onRate: (rating: DbRating) => void;
+  /** AI's advisory suggestion (writing-practice correction) -- visually marked, never auto-applied; the user still picks. */
+  suggestedRating?: DbRating | null;
+}
+
+export function RatingButtons({ onRate, suggestedRating }: RatingButtonsProps) {
   return (
     <div className="grid grid-cols-2 gap-2">
       {BUTTONS.map((b) => (
         <button
           key={b.rating}
           onClick={() => onRate(b.rating)}
-          className={`rounded-xl py-3 text-sm font-semibold text-white ${b.className}`}
+          className={`rounded-xl py-3 text-sm font-semibold text-white ${b.className} ${
+            suggestedRating === b.rating ? 'ring-4 ring-offset-2 ring-yellow-400' : ''
+          }`}
         >
           {b.label}
+          {suggestedRating === b.rating && <span className="ml-1 text-xs">(AI 추천)</span>}
         </button>
       ))}
     </div>

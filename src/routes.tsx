@@ -7,6 +7,8 @@ import ClassMode from '@/features/class-mode/ClassMode';
 import LibraryPage from '@/features/library/LibraryPage';
 import ExpressionDetailPage from '@/features/library/ExpressionDetailPage';
 import VocabularyPage from '@/features/vocabulary/VocabularyPage';
+import TodayPractice from '@/features/today/TodayPractice';
+import DashboardPage from '@/features/dashboard/DashboardPage';
 import PasteSavePage from '@/features/paste-save/PasteSavePage';
 import AiBatchAddPage from '@/features/ai-batch/AiBatchAddPage';
 import SyncStatusPage from '@/features/sync-status/SyncStatusPage';
@@ -29,6 +31,8 @@ export function AppRoutes() {
                 <Route path="/library" element={<LibraryPage />} />
                 <Route path="/expression/:id" element={<ExpressionDetailPage />} />
                 <Route path="/vocabulary" element={<VocabularyPage />} />
+                <Route path="/today" element={<TodayPractice />} />
+                <Route path="/dashboard" element={<DashboardPage />} />
                 <Route path="/paste-save" element={<PasteSavePage />} />
                 <Route path="/ai-batch" element={<AiBatchAddPage />} />
                 <Route path="/sync-status" element={<SyncStatusPage />} />

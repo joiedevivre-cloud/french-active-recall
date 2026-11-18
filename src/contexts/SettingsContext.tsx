@@ -15,6 +15,9 @@ export interface UserSettings {
   ai_conversation_daily_minutes: number;
   b2_daily_target: number;
   b2_target_date: string | null;
+  daily_writing_target: number;
+  daily_speaking_target: number;
+  desired_retention: number;
 }
 
 interface SettingsContextValue {

@@ -2,7 +2,9 @@ import { useEffect, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { supabase } from '@/lib/supabase';
 import { useAuth } from '@/contexts/AuthContext';
+import { useSettings } from '@/contexts/SettingsContext';
 import { scheduleReview, type DbRating, type ReviewStateRow } from '@/lib/fsrs';
+import { confirmReviewGrade } from '@/features/review/confirmReviewGrade';
 import { MeaningRecallCard } from '@/features/review/cards/MeaningRecallCard';
 import { FillBlankCard } from '@/features/review/cards/FillBlankCard';
 
@@ -25,6 +27,7 @@ function startOfTodayIso(): string {
 
 export default function TodayReview() {
   const { user } = useAuth();
+  const { settings } = useSettings();
   const [searchParams] = useSearchParams();
   const scope = searchParams.get('scope');
   const [queue, setQueue] = useState<ReviewCard[] | null>(null);
@@ -141,21 +144,19 @@ export default function TodayReview() {
   async function handleRate(rating: DbRating, hintUsed: boolean, responseTimeMs: number) {
     if (!user || !queue || queue.length === 0) return;
     const current = queue[0];
-    const nextRow = scheduleReview(current.reviewState, rating);
-    const nextConsecutive = rating === 'again' ? 0 : current.consecutiveCorrect + 1;
+    const nextRow = scheduleReview(current.reviewState, rating, new Date(), settings?.desired_retention);
 
-    await supabase
-      .from('review_states')
-      .update({ ...nextRow, consecutive_correct: nextConsecutive })
-      .eq('id', current.reviewStateId);
-
-    await supabase.from('review_attempts').insert({
-      user_id: user.id,
-      expression_id: current.expressionId,
-      attempt_type: current.attemptType,
-      response_time_ms: responseTimeMs,
-      hint_used: hintUsed,
-      self_rating: rating,
+    // Atomic + idempotent (migration 0015's confirm_review_grade RPC):
+    // a retried network call with the same clientId can never double-apply
+    // this FSRS rep, unlike the previous two-separate-writes approach.
+    await confirmReviewGrade(crypto.randomUUID(), {
+      reviewStateId: current.reviewStateId,
+      expressionId: current.expressionId,
+      rating,
+      attemptType: current.attemptType,
+      newReviewState: nextRow,
+      responseTimeMs,
+      hintUsed,
     });
 
     setCompletedCount((c) => c + 1);
