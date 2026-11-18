@@ -1,12 +1,17 @@
 import { supabase } from '@/lib/supabase';
 import type { BatchItemResult, DetailedBatchItemResult } from '@/features/ai-batch/aiBatchClient';
+import { guardDetailedResult } from '@/features/ai-batch/detailedAnalysisGuard';
 
 // v2: added core_pattern (multi-word idiomatic/semi-auxiliary pattern
 // recognition, e.g. "se mettre à + infinitif") as the primary field --
 // v1's sentence_structure only fit subordinate-clause sentences, so a
 // sentence like "Je me suis mise à chercher..." got nothing but a
 // word-by-word vocabulary breakdown. See README "AI 분석 품질".
-export const DETAILED_ANALYSIS_VERSION = 'detailed-v2';
+// v3: Construction grammaticale cards (required_complement/mood/preposition
+// + alternatives), structure_components, sentence_error vs learning_point,
+// French grammar terminology. Must match DETAILED_PROMPT_VERSION in
+// supabase/functions/_shared/prompts/detailedAnalysis.ts.
+export const DETAILED_ANALYSIS_VERSION = 'detailed-v3';
 
 function isDetailedResult(result: BatchItemResult | DetailedBatchItemResult): result is DetailedBatchItemResult {
   return 'sentence_structure' in result;
@@ -68,11 +73,15 @@ export async function applyAnalysisResult(
   }
 
   if (isDetailedResult(result)) {
+    // Drop self-contradicting claims (e.g. an error warning on a correct
+    // sentence) before they are cached -- see detailedAnalysisGuard.ts.
+    const guarded = guardDetailedResult(result);
     update.detailed_analysis = {
-      core_pattern: result.core_pattern,
-      sentence_structure: result.sentence_structure,
-      grammar_points: result.grammar_points,
-      vocabulary: result.vocabulary,
+      core_pattern: guarded.core_pattern,
+      sentence_structure: guarded.sentence_structure,
+      structure_components: guarded.structure_components ?? [],
+      grammar_points: guarded.grammar_points,
+      vocabulary: guarded.vocabulary,
       common_mistakes: result.common_mistakes,
       similar_expressions: result.similar_expressions,
       example_sentences: result.example_sentences,

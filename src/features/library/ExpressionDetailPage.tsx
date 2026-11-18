@@ -3,10 +3,26 @@ import { useNavigate, useParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { supabase } from '@/lib/supabase';
 import { useAuth } from '@/contexts/AuthContext';
-import { analyzeDetailed, type SentenceStructure, type VocabularyItem, type CorePattern } from '@/features/ai-batch/aiBatchClient';
+import {
+  analyzeDetailed,
+  type SentenceStructure,
+  type VocabularyItem,
+  type CorePattern,
+  type GrammarPoint,
+  type StructureComponent,
+} from '@/features/ai-batch/aiBatchClient';
 import { applyAnalysisResult, markAnalyzing } from '@/features/ai-batch/applyAnalysisResult';
 import { effectiveAnalysisState } from '@/features/ai-batch/staleAnalysis';
 import { analyzeLemmaBatch } from '@/features/vocabulary/lemmaClient';
+import {
+  complementLabelFr,
+  complementLabelKo,
+  koGlossFor,
+  posLabel,
+  registerLabel,
+  SENTENCE_STRUCTURE_LABELS,
+  toFrenchTerm,
+} from '@/lib/grammarTerms';
 
 interface LemmaAnalysisData {
   lemma_id: string;
@@ -21,7 +37,8 @@ interface LemmaAnalysisData {
 interface DetailedAnalysisData {
   core_pattern?: CorePattern | null; // absent on legacy detailed-v1 cached rows
   sentence_structure: SentenceStructure | null;
-  grammar_points: { pattern: string; meaning: string; example: string }[];
+  structure_components?: StructureComponent[]; // v3 only
+  grammar_points: GrammarPoint[]; // v3 fields optional -- legacy rows have pattern/meaning/example only
   vocabulary: VocabularyItem[];
   common_mistakes: string[];
   similar_expressions: { a: string; b: string; difference: string }[];
@@ -32,6 +49,7 @@ interface ExpressionDetailRow {
   id: string;
   expression_fr: string;
   meaning_ko: string | null;
+  corrected_fr: string | null;
   cefr_level: string | null;
   source_type: string;
   source_label: string | null;
@@ -70,7 +88,7 @@ export default function ExpressionDetailPage() {
       const { data, error } = await supabase
         .from('expressions')
         .select(
-          'id, expression_fr, meaning_ko, cefr_level, source_type, source_label, is_favorite, ai_analysis_status, analysis_requested_at, analyzed_at, detailed_analysis'
+          'id, expression_fr, meaning_ko, corrected_fr, cefr_level, source_type, source_label, is_favorite, ai_analysis_status, analysis_requested_at, analyzed_at, detailed_analysis'
         )
         .eq('id', id!)
         .eq('user_id', user!.id)
@@ -243,12 +261,23 @@ export default function ExpressionDetailPage() {
 
       {analysis && (
         <>
-          {/* 핵심 패턴 (v2): 숙어/반조동사 구문(se mettre à + infinitif 등) 인식 -- 문장 구조보다 먼저 */}
+          {/* 실제 문장 오류: corrected_fr가 있을 때만 -- 올바른 문장에는 오류 경고를 절대 표시하지 않음 */}
+          {expr.corrected_fr && expr.corrected_fr.trim() !== expr.expression_fr.trim() && (
+            <section className="rounded-2xl border border-red-200 p-4 dark:border-red-900">
+              <h2 className="mb-1 text-sm font-bold text-red-600 dark:text-red-400">이 문장의 오류</h2>
+              <p className="text-sm">
+                올바른 형태: <span className="font-medium">{expr.corrected_fr}</span>
+              </p>
+            </section>
+          )}
+
+          {/* 핵심 패턴 (v2): 숙어/준조동사 구문(se mettre à + infinitif 등) 인식 -- 문장 구조보다 먼저 */}
           {analysis.core_pattern && (
             <section className="rounded-2xl border border-blue-200 p-4 dark:border-blue-800">
               <h2 className="mb-2 text-sm font-bold">핵심 패턴</h2>
-              <p className="font-medium">
-                {analysis.core_pattern.pattern} <span className="text-sm text-slate-500">— {analysis.core_pattern.meaning_ko}</span>
+              <p className="text-xs text-slate-400">Construction grammaticale</p>
+              <p className="font-medium italic">
+                {analysis.core_pattern.pattern} <span className="text-sm not-italic text-slate-500">— {analysis.core_pattern.meaning_ko}</span>
               </p>
               <p className="mt-1 text-sm text-slate-500">문장 속 형태: {analysis.core_pattern.matched_form}</p>
               <p className="mt-2 text-sm text-slate-600 dark:text-slate-300">{analysis.core_pattern.explanation_ko}</p>
@@ -256,66 +285,97 @@ export default function ExpressionDetailPage() {
           )}
 
           {/* B. 문장 구조 */}
-          {analysis.sentence_structure && (
+          {((analysis.structure_components?.length ?? 0) > 0 || analysis.sentence_structure) && (
             <section className="rounded-2xl border border-slate-200 p-4 dark:border-slate-800">
               <h2 className="mb-2 text-sm font-bold">문장 구조</h2>
-              <dl className="flex flex-col gap-1 text-sm">
-                <Row label="주절" value={analysis.sentence_structure.main_clause} />
-                <Row label="접속사" value={analysis.sentence_structure.conjunction} />
-                <Row label="종속절" value={analysis.sentence_structure.subordinate_clause} />
-                <Row label="핵심 구조" value={analysis.sentence_structure.core_structure} />
-                <Row label="동사 원형" value={analysis.sentence_structure.infinitive} />
-                <Row label="활용형" value={analysis.sentence_structure.conjugated_form} />
-              </dl>
-              <p className="mt-2 text-sm text-slate-600 dark:text-slate-300">{analysis.sentence_structure.mood_explanation}</p>
-              {analysis.sentence_structure.mood_contrast && (
-                <p className="mt-1 text-sm text-slate-500">{analysis.sentence_structure.mood_contrast}</p>
+              {(analysis.structure_components?.length ?? 0) > 0 && (
+                <ul className="flex flex-col gap-2">
+                  {analysis.structure_components!.map((c, i) => (
+                    <li key={i} className="text-sm">
+                      <p>
+                        <span className="font-medium">{c.text}</span>{' '}
+                        <span className="text-xs text-blue-600 dark:text-blue-400">{c.function_fr}</span>
+                        {koGlossFor(c.function_fr) && <span className="text-xs text-slate-400"> ({koGlossFor(c.function_fr)})</span>}
+                      </p>
+                      <p className="text-slate-500">{c.note_ko}</p>
+                    </li>
+                  ))}
+                </ul>
               )}
-              <p className="mt-2 text-sm italic text-slate-500">{analysis.sentence_structure.overall_meaning}</p>
+              {analysis.sentence_structure && (
+                <>
+                  <dl
+                    className={`flex flex-col gap-1 text-sm ${
+                      (analysis.structure_components?.length ?? 0) > 0 ? 'mt-3 border-t border-slate-100 pt-3 dark:border-slate-800' : ''
+                    }`}
+                  >
+                    {(Object.keys(SENTENCE_STRUCTURE_LABELS) as (keyof typeof SENTENCE_STRUCTURE_LABELS)[]).map((key) => (
+                      <Row
+                        key={key}
+                        label={SENTENCE_STRUCTURE_LABELS[key].fr}
+                        gloss={SENTENCE_STRUCTURE_LABELS[key].ko}
+                        value={analysis.sentence_structure![key]}
+                      />
+                    ))}
+                  </dl>
+                  <p className="mt-2 text-sm text-slate-600 dark:text-slate-300">{analysis.sentence_structure.mood_explanation}</p>
+                  {analysis.sentence_structure.mood_contrast && (
+                    <p className="mt-1 text-sm text-slate-500">{analysis.sentence_structure.mood_contrast}</p>
+                  )}
+                  <p className="mt-2 text-sm italic text-slate-500">{analysis.sentence_structure.overall_meaning}</p>
+                </>
+              )}
             </section>
           )}
 
-          {/* 핵심 문법 */}
+          {/* 핵심 문법: Construction grammaticale 카드 + 대체 표현 + 문장 만들기 */}
           {analysis.grammar_points.length > 0 && (
             <details className="rounded-2xl border border-slate-200 p-4 dark:border-slate-800" open>
               <summary className="text-sm font-bold">핵심 문법</summary>
-              <ul className="mt-2 flex flex-col gap-3">
+              <ul className="mt-2 flex flex-col gap-4">
                 {analysis.grammar_points.map((gp, i) => (
-                  <li key={i}>
-                    <p className="font-medium">{gp.pattern}</p>
-                    <p className="text-sm text-slate-500">{gp.meaning}</p>
-                    <p className="mt-1 text-sm italic text-slate-400">{gp.example}</p>
-                  </li>
+                  <GrammarPointCard
+                    key={i}
+                    gp={gp}
+                    onPractice={() => navigate(`/expression/${expr.id}/practice?pattern=${encodeURIComponent(gp.pattern)}`)}
+                  />
                 ))}
               </ul>
             </details>
           )}
 
-          {/* D. 단어별 설명 */}
+          {/* D. 단어별 설명 -- 실제 오류(sentence_error)와 학습 포인트를 구분 */}
           {analysis.vocabulary.length > 0 && (
             <details className="rounded-2xl border border-slate-200 p-4 dark:border-slate-800">
               <summary className="text-sm font-bold">단어별 설명</summary>
               <ul className="mt-2 flex flex-col gap-3">
-                {analysis.vocabulary.map((v, i) => (
-                  <li key={i}>
-                    <p className="font-medium">
-                      {v.word} <span className="text-xs text-slate-400">({v.part_of_speech})</span>
-                    </p>
-                    <p className="text-sm text-slate-500">{v.meaning_ko}</p>
-                    <p className="text-xs text-slate-400">
-                      {[v.infinitive, v.tense_or_conjugation, v.gender_agreement, v.preposition].filter(Boolean).join(' · ')}
-                    </p>
-                    {v.common_mistake && <p className="text-xs text-amber-600">⚠ {v.common_mistake}</p>}
-                  </li>
-                ))}
+                {analysis.vocabulary.map((v, i) => {
+                  const learningPoint = v.learning_point ?? v.common_mistake ?? null;
+                  return (
+                    <li key={i}>
+                      <p className="font-medium">
+                        {v.word} <span className="text-xs text-slate-400">({posLabel(v.part_of_speech)})</span>
+                      </p>
+                      <p className="text-sm text-slate-500">{v.meaning_ko}</p>
+                      <p className="text-xs text-slate-400">
+                        {[v.infinitive, v.tense_or_conjugation && toFrenchTerm(v.tense_or_conjugation), v.gender_agreement, v.preposition]
+                          .filter(Boolean)
+                          .join(' · ')}
+                      </p>
+                      {v.sentence_error && <p className="text-xs text-red-500">⚠ 이 문장의 오류: {v.sentence_error}</p>}
+                      {learningPoint && <p className="text-xs text-slate-500">💡 학습 포인트: {learningPoint}</p>}
+                    </li>
+                  );
+                })}
               </ul>
             </details>
           )}
 
+          {/* 학습자가 자주 하는 실수 = 일반 학습 포인트 (이 문장이 틀렸다는 뜻이 아님) */}
           {analysis.common_mistakes.length > 0 && (
-            <section className="rounded-2xl border border-amber-200 p-4 dark:border-amber-800">
-              <h2 className="mb-2 text-sm font-bold">흔한 실수</h2>
-              <ul className="flex flex-col gap-1 text-sm text-amber-700 dark:text-amber-300">
+            <section className="rounded-2xl border border-slate-200 p-4 dark:border-slate-800">
+              <h2 className="mb-2 text-sm font-bold">💡 학습 포인트</h2>
+              <ul className="flex flex-col gap-1 text-sm text-slate-600 dark:text-slate-300">
                 {analysis.common_mistakes.map((m, i) => (
                   <li key={i}>• {m}</li>
                 ))}
@@ -362,12 +422,109 @@ export default function ExpressionDetailPage() {
   );
 }
 
-function Row({ label, value }: { label: string; value: string }) {
+function Row({ label, gloss, value }: { label: string; gloss?: string; value: string }) {
   if (!value) return null;
   return (
     <div className="flex gap-2">
-      <dt className="w-20 shrink-0 text-slate-400">{label}</dt>
+      <dt className="w-32 shrink-0 text-slate-400">
+        {label}
+        {gloss && <span className="block text-[10px] leading-tight">{gloss}</span>}
+      </dt>
       <dd>{value}</dd>
     </div>
+  );
+}
+
+/**
+ * One "Construction grammaticale" card. Every v3 field is optional, so a
+ * legacy (detailed-v1/v2) grammar point -- pattern/meaning/example only --
+ * renders as before, just without the new rows.
+ */
+function GrammarPointCard({ gp, onPractice }: { gp: GrammarPoint; onPractice: () => void }) {
+  const complementFr = complementLabelFr(gp.required_complement, gp.mood_requirement);
+  const complementKo = complementLabelKo(gp.required_complement, gp.mood_requirement);
+  const alternatives = gp.alternatives ?? [];
+  return (
+    <li className="flex flex-col gap-1">
+      <p className="text-xs text-slate-400">Construction grammaticale</p>
+      <p className="font-medium italic">
+        {gp.pattern}
+        {gp.meaning_ko && <span className="text-sm not-italic text-slate-500"> — {gp.meaning_ko}</span>}
+      </p>
+
+      {(complementFr || gp.preposition_rule || gp.form_in_sentence) && (
+        <dl className="mt-1 flex flex-col gap-0.5 text-sm">
+          {complementFr && (
+            <div className="flex gap-2">
+              <dt className="w-24 shrink-0 text-slate-400">뒤에 오는 요소</dt>
+              <dd>
+                {complementFr}
+                {complementKo && <span className="text-xs text-slate-400"> ({complementKo})</span>}
+              </dd>
+            </div>
+          )}
+          {gp.preposition_rule && (
+            <div className="flex gap-2">
+              <dt className="w-24 shrink-0 text-slate-400">Préposition</dt>
+              <dd>{gp.preposition_rule}</dd>
+            </div>
+          )}
+          {gp.form_in_sentence && (
+            <div className="flex gap-2">
+              <dt className="w-24 shrink-0 text-slate-400">문장 속 형태</dt>
+              <dd>{gp.form_in_sentence}</dd>
+            </div>
+          )}
+        </dl>
+      )}
+
+      <p className="text-sm text-slate-500">{gp.meaning}</p>
+      {gp.example && <p className="text-sm italic text-green-700 dark:text-green-400">✓ {gp.example}</p>}
+      {gp.incorrect_example && (
+        <p className="text-sm">
+          <span className="italic text-red-500 line-through decoration-1">✗ {gp.incorrect_example.fr}</span>
+          <span className="block text-xs text-slate-500">{gp.incorrect_example.reason_ko}</span>
+        </p>
+      )}
+      {(gp.learning_tips ?? []).map((tip, i) => (
+        <p key={i} className="text-xs text-slate-500">
+          💡 {tip}
+        </p>
+      ))}
+
+      {alternatives.length > 0 && (
+        <details className="mt-1 rounded-xl bg-slate-50 p-3 dark:bg-slate-900">
+          <summary className="cursor-pointer text-sm font-medium">비슷한 표현 / 대체 표현 ({alternatives.length})</summary>
+          <ul className="mt-2 flex flex-col gap-3">
+            {alternatives.map((alt, i) => {
+              const altComplementFr = complementLabelFr(alt.required_complement, alt.mood_requirement);
+              return (
+                <li key={i} className="text-sm">
+                  <p>
+                    <span className="font-medium italic">{alt.construction || alt.expression}</span>
+                    {registerLabel(alt.register) && <span className="ml-1 text-xs text-slate-400">· {registerLabel(alt.register)}</span>}
+                  </p>
+                  <p className="text-slate-500">
+                    {alt.meaning_ko}
+                    {altComplementFr && <span className="text-xs text-slate-400"> · 뒤에: {altComplementFr}</span>}
+                  </p>
+                  <button onClick={() => speak(alt.rewritten_sentence)} className="mt-0.5 text-left italic">
+                    🔊 {alt.rewritten_sentence}
+                  </button>
+                  <p className="text-xs text-slate-500">{alt.nuance_ko}</p>
+                </li>
+              );
+            })}
+          </ul>
+        </details>
+      )}
+
+      <button
+        onClick={onPractice}
+        className="mt-1 self-start rounded-full border border-blue-300 px-3 py-1 text-xs text-blue-600 dark:border-blue-800 dark:text-blue-400"
+      >
+        ✍️ 이 문법으로 문장 만들기
+      </button>
+    </li>
   );
 }

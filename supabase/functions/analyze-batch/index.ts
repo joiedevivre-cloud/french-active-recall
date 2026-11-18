@@ -23,6 +23,7 @@ import {
   DETAILED_RESULT_ITEM_SCHEMA,
   buildResponseSchema,
 } from '../_shared/detailedAnalysisSchema.ts';
+import { buildSystemPrompt } from '../_shared/prompts/detailedAnalysis.ts';
 
 const SUPABASE_URL = Deno.env.get('SUPABASE_URL')!;
 const SUPABASE_ANON_KEY = Deno.env.get('SUPABASE_ANON_KEY')!;
@@ -68,7 +69,25 @@ interface VocabularyItem {
   tense_or_conjugation: string | null;
   gender_agreement: string | null;
   preposition: string | null;
-  common_mistake: string | null;
+  sentence_error: string | null; // v3: real error in THIS sentence only
+  learning_point: string | null; // v3: general rule (replaces common_mistake)
+}
+
+// v3 -- shape is defined once in _shared/detailedAnalysisSchema.ts
+// (GRAMMAR_POINT_SCHEMA / STRUCTURE_COMPONENT_SCHEMA); these types only
+// mirror it for this file.
+interface GrammarPointV3 {
+  pattern: string;
+  meaning: string;
+  example: string;
+  meaning_ko: string;
+  required_complement: string;
+  mood_requirement: string;
+  preposition_rule: string | null;
+  form_in_sentence: string;
+  incorrect_example: { fr: string; reason_ko: string } | null;
+  alternatives: Record<string, string>[];
+  learning_tips: string[];
 }
 
 // v2: the primary field for detailed analysis, catching multi-word
@@ -85,7 +104,8 @@ interface CorePattern {
 interface DetailedBatchItemResult extends BatchItemResult {
   core_pattern: CorePattern | null;
   sentence_structure: SentenceStructure | null;
-  grammar_points: { pattern: string; meaning: string; example: string }[];
+  structure_components: { text: string; function_fr: string; note_ko: string }[];
+  grammar_points: GrammarPointV3[];
   vocabulary: VocabularyItem[];
   common_mistakes: string[];
   similar_expressions: { a: string; b: string; difference: string }[];
@@ -283,42 +303,7 @@ async function logUsage(
   return { id: data?.id };
 }
 
-const LIGHT_SYSTEM_PROMPT_HEADER = `You are a French teacher helping a Korean-speaking learner (studying in Montreal, A2~B2 level) who just pasted a batch of French sentences/expressions they encountered.
-
-For EACH input sentence, in the SAME ORDER, produce one result object with:
-- expression_fr: echo the original sentence back EXACTLY as given (this is used to match results back to inputs -- do not fix typos here).
-- corrected_fr: if the sentence has a real grammar/spelling error, the corrected version; otherwise null.
-- meaning_ko: a natural Korean translation.
-- grammar_note: ONE Korean paragraph covering the grammar structure AND any key vocabulary/prepositions worth noting, plus a brief note on naturalness/errors if corrected_fr is not null.
-- example_fr: one additional natural French example sentence reusing the same key expression (different from the input sentence).
-- example_translation_ko: Korean translation of that example.
-- cefr_level: your best estimate, one of A1/A2/B1/B2/C1/C2.
-- tags: 1-3 short topic/grammar tags in Korean or French (e.g. "접속법", "일상 회화").
-- key_phrase: the single core phrase/pattern from this sentence most worth memorizing (e.g. "penser à", "il faut que + subjonctif").`;
-
-// v2: core_pattern is now the PRIMARY thing to find, before any word-by-word
-// breakdown -- the v1 prompt let the model default to explaining 2-3 easy
-// words (e.g. "chercher", "nouvel") while missing the actual grammar that
-// matters (e.g. "se mettre à + infinitif" in "Je me suis mise à chercher un
-// nouvel emploi."), because sentence_structure only fit subordinate-clause
-// sentences and nothing else was positioned as "the main thing to explain."
-const KNOWN_MULTIWORD_PATTERNS = [
-  'se mettre à + infinitif', 'se rendre compte que', 'avoir beau + infinitif',
-  'il faut que + subjonctif', 'penser à + infinitif', 'penser de quelque chose',
-  'avoir du mal à + infinitif', 'venir de + infinitif', 'être en train de + infinitif',
-  'mettre à jour', 'mettre en place', "se confier à quelqu'un",
-  'faire en sorte que + subjonctif',
-].join(', ');
-
-const DETAILED_SYSTEM_PROMPT_EXTRA = `
-You are also asked for a deeper B1~B2 breakdown of this ONE sentence, for all the fields above PLUS:
-- core_pattern: FIND THIS FIRST, before anything else below. Almost every sentence has ONE dominant grammatical pattern or multi-word idiomatic/semi-auxiliary construction that a Korean learner must recognize to understand and reuse the sentence -- this is usually MORE important than any single word. Recognize it even when conjugated/inflected and even when other words are inserted between its parts (e.g. "se mettre à" realized as "je me suis mise à chercher" -- the pattern is still "se mettre à + infinitif", matched_form is "me suis mise à chercher"). Known examples (not exhaustive -- recognize others too): ${KNOWN_MULTIWORD_PATTERNS}. Fill in: pattern (canonical/dictionary form), meaning_ko (short Korean gloss), matched_form (the exact text in THIS sentence that realizes it), explanation_ko (Korean: why this form is used here). Set to null ONLY if the sentence genuinely has no dominant pattern (e.g. a single simple noun phrase) -- this should be rare.
-- sentence_structure: ONLY if the sentence additionally has a main clause + subordinate clause (e.g. "il faut que + subjonctif"), fill in main_clause, conjunction, subordinate_clause, core_structure, infinitive (the subordinate verb's infinitive, or "" if none), conjugated_form (the actual conjugated form used, or "" if none), mood_explanation (Korean: why this mood -- subjunctive/indicative/etc. -- is used here), mood_contrast (Korean: how the meaning would differ with the other mood, or "" if not applicable), overall_meaning (Korean: a natural reading of the whole sentence). Most sentences WITHOUT a subordinate clause should set this to null -- it is secondary to core_pattern, not a duplicate of it.
-- grammar_points: 1 to 3 objects {pattern, meaning, example}, most useful first, covering whichever of these actually apply to THIS sentence (skip ones that don't apply -- never pad): which auxiliary (avoir/être) a compound-tense verb uses and why; past-participle gender/number agreement, giving BOTH the masculine and feminine form when the subject's gender affects it (e.g. "mis (남성) / mise (여성)"); the role of any reflexive/object/relative pronoun; why a specific preposition is used; elision/liaison-driven word forms (e.g. "nouvel" before a vowel-initial masculine noun, instead of "nouveau"). meaning is a Korean explanation anchored in THIS sentence's actual words, not a generic textbook definition. example is a different French sentence using the same point.
-- vocabulary: 0 to 6 objects for words/short expressions genuinely worth explaining ON THEIR OWN, skipping anything already explained by core_pattern or grammar_points above (never explain the same word twice) and skipping articles/trivial words. Each: {word, part_of_speech, meaning_ko, infinitive (verb's dictionary form, or null), tense_or_conjugation (or null), gender_agreement (or null), preposition (preposition this word pairs with, or null), common_mistake (a mistake Korean learners often make with this word, or null)}.
-- common_mistakes: 0 to 3 short Korean strings about mistakes Korean learners commonly make with THIS sentence/expression as a whole (separate from core_pattern/grammar_points/vocabulary -- e.g. wrong gender agreement, missing "à", wrong verb form). Empty array if none stand out.
-- similar_expressions: 0 to 3 objects {a, b, difference} ONLY for expressions genuinely easy to confuse with something in this sentence (e.g. "penser à" / "penser de", "depuis" / "pendant"). difference is a short Korean explanation. Return an empty array rather than inventing a comparison that isn't real.
-- example_sentences: EXACTLY 2 objects {fr, ko} -- new natural French example sentences reusing this sentence's key pattern/structure, set in everyday Quebec life, at B1 level. Do not invent facts about a specific person; keep them generic.`;
+// Prompts live in ../_shared/prompts/detailedAnalysis.ts (tested from Vitest).
 
 async function callOpenAI(
   sentences: string[],
@@ -326,10 +311,7 @@ async function callOpenAI(
   maxOutputTokens: number,
   detailed: boolean
 ): Promise<{ results: (BatchItemResult | DetailedBatchItemResult)[]; inputTokens: number; outputTokens: number }> {
-  const systemPrompt =
-    LIGHT_SYSTEM_PROMPT_HEADER +
-    (detailed ? DETAILED_SYSTEM_PROMPT_EXTRA : '') +
-    `\n\nReturn exactly ${sentences.length} result objects, one per input sentence, in input order. Never invent sentences that weren't given.`;
+  const systemPrompt = buildSystemPrompt(sentences.length, detailed);
 
   const schema = detailed ? DETAILED_RESULT_ITEM_SCHEMA : LIGHT_RESULT_ITEM_SCHEMA;
 

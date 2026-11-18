@@ -195,6 +195,54 @@ Vitest 양쪽에서 같은 파일 import, `lemmaMatching.ts`와 동일 패턴).
 [선택] 모드로 여러 표현 체크 후 [선택한 표현 AI 분석] / [미완료 전체 다시
 분석] / "실패한 표현만"·"뜻 없는 표현만" 빠른 선택 가능.
 
+### 상세 문법 분석 v3 + 프랑스어 문법 용어 표준화 (`detailed-v3`)
+
+목표: 설명을 읽는 데서 끝나지 않고 **뒤에 어떤 요소가 와야 하는지 이해하고
+다른 문장으로 바꿔 쓸 수 있게** 하는 것. 화면 구성(문장 구조 / 핵심 문법 /
+단어별 설명 / 응용 예문)과 디자인은 그대로 두고 각 섹션을 확장했다.
+
+- **Construction grammaticale 카드** (핵심 문법): 패턴 기본형, 한국어 의미,
+  뒤에 오는 요소(`required_complement`: groupe nominal (GN) / pronom /
+  infinitif / proposition / proposition indépendante), 필요한 법
+  (`mood_requirement`: indicatif / subjonctif / conditionnel), 필수 전치사,
+  문장 속 형태, ✓ 올바른 예문, ✗ 흔한 오류 + 이유, 학습 팁.
+  `grammar_points[0]`은 항상 핵심 패턴의 construction. enum은 단어장
+  `lemma_usages`(0016)와 동일하다.
+- **비슷한 표현 / 대체 표현**: 같은 뜻을 다른 construction으로 바꾼 문장
+  (예: malgré + GN → même si + indicatif / bien que + subjonctif /
+  pourtant + proposition indépendante / en dépit de + GN), 각각 의미 차이와
+  register(familier/courant/soutenu)를 함께 보여준다.
+- **문장 구조** `structure_components`: 여러 단어로 된 표현은 한 단위로
+  묶어서 문법 관계를 표시(se rendre compte → verbe pronominal, que →
+  conjonction de subordination, faire des progrès → locution verbale).
+  기존 절 단위 `sentence_structure`도 계속 표시한다.
+- **실제 오류 vs 학습 포인트**: 단어별 설명의 `common_mistake`를
+  `sentence_error`(이 문장의 실제 오류)와 `learning_point`(일반 규칙)로
+  나눔. `guardDetailedResult()`(`src/features/ai-batch/detailedAnalysisGuard.ts`)가
+  저장 전에 검사해서 **올바른 문장(corrected_fr 없음)의 오류 주장은 제거**
+  한다 (fatigue 성별 경고 / apprendre 동사 형태 경고 같은 허위 경고 방지).
+  ⚠는 실제 오류에만 쓰고, 일반 주의사항은 💡 학습 포인트로 표시한다.
+  옛 분석의 `common_mistake`도 학습 포인트로 표시한다.
+- **✍️ 이 문법으로 문장 만들기** (`/expression/:id/practice?pattern=...`):
+  AI가 새 한국어 상황 제시 → 프랑스어 작성 → AI가 의미·문법·목표 문법
+  사용 여부 평가 → 사용자 평가로 해당 표현의 FSRS 카드 갱신 → 목표 문법을
+  안 썼거나 틀렸으면 `grammar_skills`에 오답으로 기록되어 오늘의 학습
+  큐에서 약한 문법으로 우선 출제된다. 기존 `writing-practice`
+  (`korean_prompt` + 새 `targetPattern` 파라미터)를 재사용하고, 문제는
+  construction별로 캐시한다.
+- **프랑스어 문법 용어 표준화**: 문법 명칭·문장 성분·연결 규칙은 프랑스어
+  용어, 의미·해설은 한국어로 쓴다. AI 프롬프트(`TERMINOLOGY_RULES`,
+  `supabase/functions/_shared/prompts/detailedAnalysis.ts`)와 UI 공통 사전
+  `src/lib/grammarTerms.ts`(용어 ↔ 한국어 풀이, enum → 프랑스어 라벨,
+  옛 한국어 용어 → 프랑스어)를 함께 쓴다. 옛 분석에 남은 한국어 문법
+  명칭도 재분석 없이 프랑스어로 보이고, 사전에 없는 문구는 그대로 표시한다.
+- 출력 토큰: 상세 분석 1문장 추정치를 2200 → 5500으로, 상세 모드 상한을
+  8000으로 올렸다(일괄 분석은 4000 그대로). `0017`에서
+  `ai_rate_limits.max_output_tokens`도 8000으로 올린다. **함수 배포 전에
+  실행해야 한다.**
+- 기존 v1/v2 분석은 그대로 표시된다(v3 필드는 전부 optional). 새 형식으로
+  보려면 `[AI 다시 분석]`을 누른다.
+
 ## 단어장 (lemma/쓰임 분류)
 
 표현장의 표현들을 핵심 단어(lemma, 예: "mettre") 기준으로 묶어서 쓰임별로
@@ -354,6 +402,11 @@ Editor(또는 `supabase db push`)에서 직접 실행한다 — 자동으로 적
     "둘 중 정확히 하나" CHECK 추가, `confirm_review_grade` 재생성
     (`p_lemma_usage_id` 추가, 이름 기반 호출이라 기존 호출부 무변경).
     삭제/이름변경 없음
+
+17. `0017_detailed_analysis_v3_tokens.sql` — 상세 분석 v3 출력이 잘리지
+    않도록 `ai_rate_limits.max_output_tokens` 기본값/기존값(4000인 행만)을
+    8000으로 올림. 일괄 분석은 코드에서 4000으로 따로 막혀 있음. 데이터
+    삭제 없음. **`analyze-batch` 배포 전에 실행**
 
 ## Edge Function 배포
 

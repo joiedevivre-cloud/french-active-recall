@@ -116,18 +116,25 @@ async function handleGenerate(admin: ReturnType<typeof createClient>, userId: st
   const mode = body.mode as string | undefined;
   const grammarTags = Array.isArray(body.grammarTags) ? (body.grammarTags as string[]) : [];
   const forceNew = body.forceNew === true;
+  // "이 문법으로 문장 만들기" (expression detail screen): practice ONE specific
+  // construction of the expression (e.g. its 2nd grammar point), not just
+  // the expression's main pattern. Cached separately per construction.
+  const targetPattern =
+    typeof body.targetPattern === 'string' && body.targetPattern.trim() ? body.targetPattern.trim().slice(0, 200) : null;
 
   if (!expressionId || !mode || !MODE_GUIDANCE[mode]) return jsonResponse({ error: 'missing_or_invalid_fields' }, 400);
 
   const { data: expr } = await admin.from('expressions').select('id, expression_fr').eq('id', expressionId).eq('user_id', userId).maybeSingle();
   if (!expr) return jsonResponse({ error: 'expression_not_found' }, 404);
 
-  const { data: existing } = await admin
+  let existingQuery = admin
     .from('writing_exercises')
     .select('id, times_used, prompt_ko, prompt_fr_pattern, scenario_context')
     .eq('user_id', userId)
     .eq('expression_id', expressionId)
     .eq('mode', mode);
+  if (targetPattern) existingQuery = existingQuery.eq('prompt_fr_pattern', targetPattern);
+  const { data: existing } = await existingQuery;
 
   const cached = pickCachedExercise((existing ?? []).map((r) => ({ id: r.id, timesUsed: r.times_used })), forceNew);
 
@@ -157,7 +164,11 @@ async function handleGenerate(admin: ReturnType<typeof createClient>, userId: st
     if (!OPENAI_API_KEY) return jsonResponse({ error: 'openai_key_not_configured' }, 500);
     const model = limits.allowed_models?.[0] ?? 'gpt-4o-mini';
 
-    const systemPrompt = `You generate French-learning writing exercises for a Korean-speaking learner (B1~B2, living in Montreal). The learner already saved this expression: "${expr.expression_fr}". ${MODE_GUIDANCE[mode]} Never fabricate facts about a specific real person.`;
+    const systemPrompt = `You generate French-learning writing exercises for a Korean-speaking learner (B1~B2, living in Montreal). The learner already saved this expression: "${expr.expression_fr}". ${MODE_GUIDANCE[mode]}${
+      targetPattern
+        ? ` TARGET CONSTRUCTION (required): the situation must make the learner naturally use exactly "${targetPattern}" -- not the expression's other grammar. Set prompt_fr_pattern to exactly "${targetPattern}". Use a NEW situation (different subject/context from the saved expression).`
+        : ''
+    } Write prompt_fr_pattern with standard French grammar terms (e.g. "bien que + proposition au subjonctif", "se mettre à + infinitif"). Never fabricate facts about a specific real person.`;
     const completion = await callOpenAI(systemPrompt, 'Generate one exercise now.', model, GENERATE_RESULT_SCHEMA, 'exercise_generation', GENERATE_MAX_OUTPUT_TOKENS);
 
     const contentHash = await sha256Hex(JSON.stringify(completion.result));
@@ -170,7 +181,7 @@ async function handleGenerate(admin: ReturnType<typeof createClient>, userId: st
           mode,
           grammar_tags: grammarTags,
           prompt_ko: completion.result.prompt_ko,
-          prompt_fr_pattern: completion.result.prompt_fr_pattern,
+          prompt_fr_pattern: targetPattern ?? completion.result.prompt_fr_pattern,
           scenario_context: completion.result.scenario_context,
           model,
           prompt_version: PROMPT_VERSION,
@@ -194,7 +205,7 @@ async function handleGenerate(admin: ReturnType<typeof createClient>, userId: st
         id: inserted.id,
         mode,
         promptKo: completion.result.prompt_ko,
-        promptFrPattern: completion.result.prompt_fr_pattern,
+        promptFrPattern: targetPattern ?? completion.result.prompt_fr_pattern,
         scenarioContext: completion.result.scenario_context,
         grammarTags,
       },
@@ -236,7 +247,7 @@ async function handleCorrect(admin: ReturnType<typeof createClient>, userId: str
     if (!OPENAI_API_KEY) return jsonResponse({ error: 'openai_key_not_configured' }, 500);
     const model = limits.allowed_models?.[0] ?? 'gpt-4o-mini';
 
-    const systemPrompt = `You correct a Korean-speaking French learner's (B1~B2) written answer to a practice exercise. Evaluate ONLY what is given -- never fabricate facts about the learner. Multiple different phrasings can be equally correct; NEVER grade by exact string match against any single "expected" sentence. If the answer already conveys the meaning correctly and naturally, set corrected_fr to null -- do not force an unnecessary correction. explanation_ko is a short Korean explanation of the most important issue (or why it's already good). grammar_error_tags: short snake_case-ish tags for grammar points that need more practice (e.g. "subjonctif", "penser_a_de"), empty array if none.${targetGrammar ? ` Target grammar for this exercise: ${targetGrammar} -- set target_grammar_used accordingly.` : ' There is no specific target grammar for this exercise -- set target_grammar_used to null.'}`;
+    const systemPrompt = `You correct a Korean-speaking French learner's (B1~B2) written answer to a practice exercise. Evaluate ONLY what is given -- never fabricate facts about the learner. Multiple different phrasings can be equally correct; NEVER grade by exact string match against any single "expected" sentence. If the answer already conveys the meaning correctly and naturally, set corrected_fr to null -- do not force an unnecessary correction. explanation_ko is a short Korean explanation of the most important issue (or why it's already good); name grammar concepts with standard French terms (subjonctif, infinitif, groupe nominal (GN), proposition subordonnée, accord du participe passé...), explain in Korean. grammar_error_tags: short snake_case-ish tags for grammar points that need more practice (e.g. "subjonctif", "penser_a_de"), empty array if none.${targetGrammar ? ` Target grammar for this exercise: ${targetGrammar} -- set target_grammar_used accordingly.` : ' There is no specific target grammar for this exercise -- set target_grammar_used to null.'}`;
     const userPrompt = JSON.stringify({ learner_answer_fr: userAnswerFr });
 
     const completion = await callOpenAI(systemPrompt, userPrompt, model, CORRECT_RESULT_SCHEMA, 'writing_correction', CORRECT_MAX_OUTPUT_TOKENS);
@@ -251,8 +262,13 @@ async function handleCorrect(admin: ReturnType<typeof createClient>, userId: str
 
     const cleanTags = sanitizeGrammarTags(result.grammar_error_tags);
     const allTags = [...new Set([...grammarTags, ...cleanTags])];
+    // Not using the target construction at all counts as a miss for it,
+    // even if the sentence is otherwise fine -- that is what puts a weak
+    // construction back in front of the learner (grammar_skills feeds
+    // buildTodayQueue's weak-tag priority).
+    const attemptCorrect = result.meaning_ok && result.grammar_errors.length === 0 && result.target_grammar_used !== false;
     for (const tag of allTags) {
-      await admin.rpc('record_grammar_attempt', { p_tag: tag, p_correct: result.meaning_ok && result.grammar_errors.length === 0 });
+      await admin.rpc('record_grammar_attempt', { p_tag: tag, p_correct: attemptCorrect });
     }
 
     const pricing = MODEL_PRICING_PER_1M_TOKENS[model] ?? MODEL_PRICING_PER_1M_TOKENS['gpt-4o-mini'];

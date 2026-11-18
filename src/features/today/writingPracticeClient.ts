@@ -59,11 +59,11 @@ async function describeInvokeError(response: Response | undefined): Promise<stri
 export async function generateExercise(
   expressionId: string,
   mode: WritingMode,
-  options?: { grammarTags?: string[]; forceNew?: boolean }
+  options?: { grammarTags?: string[]; forceNew?: boolean; targetPattern?: string | null }
 ): Promise<GenerateOutcome> {
   try {
     const { data, error, response } = await supabase.functions.invoke('writing-practice', {
-      body: { action: 'generate', expressionId, mode, grammarTags: options?.grammarTags ?? [], forceNew: options?.forceNew ?? false },
+      body: { action: 'generate', expressionId, mode, grammarTags: options?.grammarTags ?? [], forceNew: options?.forceNew ?? false, targetPattern: options?.targetPattern ?? null },
     });
     if (error) return { status: 'failed', error: await describeInvokeError(response) };
     if (!data?.ok) return { status: 'failed', error: data?.error ?? 'invalid_response' };

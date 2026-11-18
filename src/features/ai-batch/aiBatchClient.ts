@@ -41,7 +41,53 @@ export interface VocabularyItem {
   tense_or_conjugation: string | null;
   gender_agreement: string | null;
   preposition: string | null;
-  common_mistake: string | null;
+  /** v3: a REAL error in THIS sentence involving this word (null whenever the sentence is correct -- enforced by guardDetailedResult). */
+  sentence_error?: string | null;
+  /** v3: a general rule worth knowing -- shown as a learning point, never as a warning. */
+  learning_point?: string | null;
+  /** Legacy (detailed-v1/v2) mixed field -- rendered as a learning point, never as a warning. */
+  common_mistake?: string | null;
+}
+
+export type RequiredComplement = 'nom' | 'pronom' | 'infinitif' | 'clause' | 'independent';
+export type MoodRequirement = 'indicatif' | 'subjonctif' | 'conditionnel' | 'none';
+
+/** v3: same idea, different construction (e.g. malgré + GN -> bien que + proposition au subjonctif). */
+export interface GrammarAlternative {
+  expression: string;
+  construction: string;
+  required_complement: RequiredComplement;
+  mood_requirement: MoodRequirement;
+  meaning_ko: string;
+  nuance_ko: string;
+  register: 'familier' | 'courant' | 'soutenu';
+  rewritten_sentence: string;
+}
+
+/**
+ * A "Construction grammaticale" card. pattern/meaning/example exist on
+ * every version; everything else is v3-only and optional so legacy rows
+ * (detailed-v1/v2) render through the same component.
+ */
+export interface GrammarPoint {
+  pattern: string;
+  meaning: string;
+  example: string;
+  meaning_ko?: string;
+  required_complement?: RequiredComplement;
+  mood_requirement?: MoodRequirement;
+  preposition_rule?: string | null;
+  form_in_sentence?: string;
+  incorrect_example?: { fr: string; reason_ko: string } | null;
+  alternatives?: GrammarAlternative[];
+  learning_tips?: string[];
+}
+
+/** v3: one grammatical relation in the sentence; multi-word units stay one component. */
+export interface StructureComponent {
+  text: string;
+  function_fr: string;
+  note_ko: string;
 }
 
 /**
@@ -67,7 +113,8 @@ export interface CorePattern {
 export interface DetailedBatchItemResult extends BatchItemResult {
   core_pattern: CorePattern | null;
   sentence_structure: SentenceStructure | null;
-  grammar_points: { pattern: string; meaning: string; example: string }[];
+  structure_components?: StructureComponent[]; // v3
+  grammar_points: GrammarPoint[];
   vocabulary: VocabularyItem[];
   common_mistakes: string[];
   similar_expressions: { a: string; b: string; difference: string }[];

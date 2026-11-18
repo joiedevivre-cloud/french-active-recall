@@ -6,6 +6,7 @@ import HomePage from '@/features/home/HomePage';
 import ClassMode from '@/features/class-mode/ClassMode';
 import LibraryPage from '@/features/library/LibraryPage';
 import ExpressionDetailPage from '@/features/library/ExpressionDetailPage';
+import GrammarPracticePage from '@/features/library/GrammarPracticePage';
 import VocabularyPage from '@/features/vocabulary/VocabularyPage';
 import TodayPractice from '@/features/today/TodayPractice';
 import DashboardPage from '@/features/dashboard/DashboardPage';
@@ -30,6 +31,7 @@ export function AppRoutes() {
                 <Route path="/class-mode" element={<ClassMode />} />
                 <Route path="/library" element={<LibraryPage />} />
                 <Route path="/expression/:id" element={<ExpressionDetailPage />} />
+                <Route path="/expression/:id/practice" element={<GrammarPracticePage />} />
                 <Route path="/vocabulary" element={<VocabularyPage />} />
                 <Route path="/today" element={<TodayPractice />} />
                 <Route path="/dashboard" element={<DashboardPage />} />

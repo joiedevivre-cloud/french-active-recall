@@ -4,6 +4,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { supabase } from '@/lib/supabase';
 import { useAuth } from '@/contexts/AuthContext';
 import { seedLemmaDictionary } from '@/features/vocabulary/lemmaClient';
+import { complementLabelFr, complementLabelKo, registerLabel } from '@/lib/grammarTerms';
 
 interface GrammarNotes {
   conjugation_present?: string;
@@ -354,6 +355,13 @@ export default function VocabularyPage() {
                   Construction grammaticale: <span className="italic">{usage.pattern}</span>
                 </p>
               )}
+              {complementLabelFr(usage.required_complement, usage.mood_requirement) && (
+                <p className="text-xs text-slate-400">
+                  뒤에 오는 요소: {complementLabelFr(usage.required_complement, usage.mood_requirement)}
+                  {complementLabelKo(usage.required_complement, usage.mood_requirement) &&
+                    ` (${complementLabelKo(usage.required_complement, usage.mood_requirement)})`}
+                </p>
+              )}
 
               {editingUsageId === usage.id && editField === 'meaning_ko' ? (
                 <div className="mt-1 flex items-center gap-2">
@@ -400,7 +408,7 @@ export default function VocabularyPage() {
                       <li key={i} className="text-xs">
                         <p className="font-medium">{alt.expression}</p>
                         <p className="text-slate-500">
-                          {alt.meaning_ko} ({alt.register})
+                          {alt.meaning_ko} ({registerLabel(alt.register)})
                         </p>
                         <p className="text-slate-400">{alt.nuance_difference_ko}</p>
                       </li>
