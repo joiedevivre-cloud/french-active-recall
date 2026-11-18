@@ -7,7 +7,9 @@ import ClassMode from '@/features/class-mode/ClassMode';
 import LibraryPage from '@/features/library/LibraryPage';
 import ExpressionDetailPage from '@/features/library/ExpressionDetailPage';
 import GrammarPracticePage from '@/features/library/GrammarPracticePage';
-import VocabularyPage from '@/features/vocabulary/VocabularyPage';
+import VocabularyListPage from '@/features/vocabulary/VocabularyListPage';
+import VocabularyDetailPage from '@/features/vocabulary/VocabularyDetailPage';
+import MorePage from '@/features/more/MorePage';
 import TodayPractice from '@/features/today/TodayPractice';
 import DashboardPage from '@/features/dashboard/DashboardPage';
 import PasteSavePage from '@/features/paste-save/PasteSavePage';
@@ -33,7 +35,9 @@ export function AppRoutes() {
                 <Route path="/library" element={<LibraryPage />} />
                 <Route path="/expression/:id" element={<ExpressionDetailPage />} />
                 <Route path="/expression/:id/practice" element={<GrammarPracticePage />} />
-                <Route path="/vocabulary" element={<VocabularyPage />} />
+                <Route path="/vocabulary" element={<VocabularyListPage />} />
+                <Route path="/vocabulary/:lemmaId" element={<VocabularyDetailPage />} />
+                <Route path="/more" element={<MorePage />} />
                 <Route path="/today" element={<TodayPractice />} />
                 <Route path="/dashboard" element={<DashboardPage />} />
                 <Route path="/paste-save" element={<PasteSavePage />} />

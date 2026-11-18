@@ -209,7 +209,7 @@ export default function ExpressionDetailPage() {
           <div className="flex flex-col gap-2">
             <div className="flex items-center justify-between">
               <button
-                onClick={() => navigate(`/vocabulary?lemma=${lemmaAnalysis.lemma_id}`)}
+                onClick={() => navigate(`/vocabulary/${lemmaAnalysis.lemma_id}?usage=${lemmaAnalysis.usage_id}`)}
                 className="rounded-full bg-slate-100 px-3 py-1 text-sm dark:bg-slate-800"
               >
                 쓰임: {lemmaAnalysis.lemmas?.lemma} – {lemmaAnalysis.lemma_usages?.label}

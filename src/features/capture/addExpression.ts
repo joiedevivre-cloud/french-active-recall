@@ -2,7 +2,7 @@ import { supabase } from '@/lib/supabase';
 import { offlineDB, type PendingExpression } from '@/lib/db';
 import { normalizeFr } from '@/lib/normalizeFr';
 import { parsePasteText } from '@/lib/pasteParser';
-import { triggerAutoAnalysis } from '@/features/ai-batch/autoAnalyze';
+import { triggerAutoAnalysis, type AnalyzableRow } from '@/features/ai-batch/autoAnalyze';
 
 export interface AddExpressionInput {
   userId: string;
@@ -106,7 +106,7 @@ export async function addExpression(input: AddExpressionInput): Promise<AddExpre
   }
 
   let onlineCount = 0;
-  const needsAnalysis: { expressionId: string; expressionFr: string }[] = [];
+  const needsAnalysis: AnalyzableRow[] = [];
   for (const row of rows) {
     const clientId = crypto.randomUUID();
     const { data, error } = await supabase
@@ -133,7 +133,7 @@ export async function addExpression(input: AddExpressionInput): Promise<AddExpre
 
     onlineCount++;
     await enqueueForReview(input.userId, data.id);
-    if (!row.meaningKo) needsAnalysis.push({ expressionId: data.id, expressionFr: row.expressionFr });
+    needsAnalysis.push({ expressionId: data.id, expressionFr: row.expressionFr, needsMeaning: !row.meaningKo });
   }
 
   // One batched call (via analyze-batch) instead of one Edge Function
@@ -200,7 +200,7 @@ async function repairPendingExpression(row: PendingExpression): Promise<PendingE
  */
 export async function syncPendingExpressions(userId: string): Promise<void> {
   const pending = await offlineDB.pendingExpressions.where({ userId }).and((row) => row.syncStatus !== 'synced').toArray();
-  const needsAnalysis: { expressionId: string; expressionFr: string }[] = [];
+  const needsAnalysis: AnalyzableRow[] = [];
 
   for (const original of pending) {
     let rowsToSync: PendingExpression[];
@@ -241,7 +241,7 @@ export async function syncPendingExpressions(userId: string): Promise<void> {
 
         await offlineDB.pendingExpressions.update(row.clientId, { syncStatus: 'synced', lastError: null });
         await enqueueForReview(row.userId, data.id);
-        if (!row.meaningKo) needsAnalysis.push({ expressionId: data.id, expressionFr: row.expressionFr });
+        needsAnalysis.push({ expressionId: data.id, expressionFr: row.expressionFr, needsMeaning: !row.meaningKo });
       } catch (err) {
         await offlineDB.pendingExpressions.update(row.clientId, {
           syncStatus: 'error',

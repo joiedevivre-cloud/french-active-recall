@@ -172,14 +172,13 @@ async function syncOnePasteBatch(batch: PendingPasteBatch): Promise<SavedRowResu
 
   await offlineDB.pendingPasteBatches.update(batch.batchClientId, { syncStatus: 'synced', lastError: null });
 
-  // Only expressions the user didn't already give a meaning to need AI --
-  // one that came with "fr — ko" already filled in (or from /ai-batch,
-  // which analyzes before saving) is skipped, so a duplicate paste never
-  // re-spends an AI call on something already known.
-  const needsAnalysis = saved.filter((_row, i) => !batch.rows[i].meaningKo);
-  void triggerAutoAnalysis(needsAnalysis.map((row) => ({ expressionId: row.expressionId, expressionFr: row.expressionFr }))).catch(
-    () => {}
-  );
+  // Meaning analysis only for rows the user didn't already give a meaning
+  // to (a "fr — ko" paste or /ai-batch result never re-spends an AI call on
+  // a known meaning) -- but EVERY saved row gets the sentence/word analysis
+  // for the 단어장 (see triggerAutoAnalysis).
+  void triggerAutoAnalysis(
+    saved.map((row) => ({ expressionId: row.expressionId, expressionFr: row.expressionFr, needsMeaning: !row.meaningKo }))
+  ).catch(() => {});
 
   return saved;
 }

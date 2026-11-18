@@ -7,6 +7,7 @@ import { QuickAddSheet } from '@/features/capture/QuickAddSheet';
 import { useOfflineSync } from '@/features/capture/useOfflineSync';
 import { useTodayExpressions } from '@/features/capture/useTodayExpressions';
 import { usePasteOfflineSync } from '@/features/paste-save/usePasteOfflineSync';
+import { HomeSearch } from '@/features/home/HomeSearch';
 
 export default function HomePage() {
   const { user } = useAuth();
@@ -42,6 +43,8 @@ export default function HomePage() {
           </Link>
         )}
       </div>
+
+      <HomeSearch />
 
       <button
         onClick={() => setAddOpen(true)}
