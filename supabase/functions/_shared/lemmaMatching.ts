@@ -3,6 +3,7 @@
 // src/features/vocabulary/lemmaMatching.test.ts, which imports this same
 // file by relative path -- there must be exactly one copy of this logic).
 // No Deno-specific APIs here.
+import { canonicalizePattern } from './patternNotation.ts';
 
 export function shouldSkipAnalysis(hasExistingAnalysis: boolean, force: boolean): boolean {
   return hasExistingAnalysis && !force;
@@ -27,6 +28,15 @@ export function normalizePattern(pattern: string): string {
 }
 
 /**
+ * Comparison key for two patterns: standard notation first (qqn / qqch /
+ * inf. -- so "nom (사람)" and "groupe nominal (personne)" are the same
+ * slot), then normalizePattern. Still an exact construction match.
+ */
+export function patternKey(pattern: string): string {
+  return normalizePattern(canonicalizePattern(pattern));
+}
+
+/**
  * Validates that an AI-suggested existing_usage_id ACTUALLY belongs to the
  * lemma it was offered alongside AND that the grammar pattern the AI just
  * recognized in this sentence genuinely matches that usage's own stored
@@ -45,7 +55,7 @@ export function resolveExistingUsageId(
   if (!aiSuggestedUsageId) return null;
   const match = usagesForThisLemma.find((u) => u.id === aiSuggestedUsageId);
   if (!match || !match.pattern) return null;
-  return normalizePattern(match.pattern) === normalizePattern(aiRecognizedPattern) ? aiSuggestedUsageId : null;
+  return patternKey(match.pattern) === patternKey(aiRecognizedPattern) ? aiSuggestedUsageId : null;
 }
 
 export function shouldCreateNewUsage(resolvedUsageId: string | null): boolean {
@@ -61,8 +71,8 @@ export function shouldCreateNewUsage(resolvedUsageId: string | null): boolean {
  * AI-suggested id here, just a pattern to find a home for).
  */
 export function findMergeTargetUsageId(newPattern: string, existingUsages: { id: string; pattern: string | null }[]): string | null {
-  const normalized = normalizePattern(newPattern);
-  return existingUsages.find((u) => u.pattern && normalizePattern(u.pattern) === normalized)?.id ?? null;
+  const key = patternKey(newPattern);
+  return existingUsages.find((u) => u.pattern && patternKey(u.pattern) === key)?.id ?? null;
 }
 
 /**

@@ -1,4 +1,7 @@
 import { supabase } from '@/lib/supabase';
+import type { PreparedSense, RejectedSense } from '../../../supabase/functions/_shared/prompts/seedDictionary';
+
+export type { PreparedSense, RejectedSense };
 
 const MAX_IDS_PER_CALL = 20;
 
@@ -40,21 +43,30 @@ export async function analyzeLemmaBatch(expressionIds: string[], force = false):
   }
 }
 
-export interface SeedDictionaryOutcome {
-  status: 'success' | 'failed';
-  senseCount?: number;
-  error?: string;
+
+export interface SeedPreview {
+  senses: PreparedSense[];
+  rejected: RejectedSense[];
+  models?: { generate: string; verify: string };
 }
 
-/** Generates a lemma's main dictionary senses up front (separate AI task from analyzeLemmaBatch's per-sentence classification). Never throws. */
-export async function seedLemmaDictionary(lemmaId: string): Promise<SeedDictionaryOutcome> {
-  try {
-    const { data, error } = await supabase.functions.invoke('analyze-lemma', { body: { action: 'seed_dictionary', lemmaId } });
-    if (error || !data?.ok) {
-      return { status: 'failed', error: data?.error ?? error?.message ?? 'invalid_response' };
-    }
-    return { status: 'success', senseCount: data.senseCount };
-  } catch (err) {
-    return { status: 'failed', error: err instanceof Error ? err.message : 'unknown_error' };
-  }
+function invokeError(data: { error?: string; message?: string } | null, error: { message?: string } | null): Error {
+  return new Error(data?.message ?? data?.error ?? error?.message ?? 'invalid_response');
+}
+
+/**
+ * "사전 쓰임 추가 (AI)" step 1: generate + strong-model self-check on the
+ * server. Nothing is saved -- the learner picks what to keep.
+ */
+export async function previewSeedDictionary(lemmaId: string): Promise<SeedPreview> {
+  const { data, error } = await supabase.functions.invoke('analyze-lemma', { body: { action: 'seed_dictionary', mode: 'preview', lemmaId } });
+  if (error || !data?.ok) throw invokeError(data, error);
+  return { senses: data.senses ?? [], rejected: data.rejected ?? [], models: data.models };
+}
+
+/** Step 2: save the picked senses (server re-runs the code rules; no AI call). */
+export async function applySeedDictionary(lemmaId: string, senses: PreparedSense[]): Promise<{ usageIds: string[]; rejected: RejectedSense[] }> {
+  const { data, error } = await supabase.functions.invoke('analyze-lemma', { body: { action: 'seed_dictionary', mode: 'apply', lemmaId, senses } });
+  if (error || !data?.ok) throw invokeError(data, error);
+  return { usageIds: data.usageIds ?? [], rejected: data.rejected ?? [] };
 }

@@ -4,8 +4,12 @@
 // - 'classify' (default, backward compatible): groups ONE saved sentence
 //   under its lemma + the exact grammatical construction it demonstrates.
 //   Cached per expression in expression_analysis.
-// - 'seed_dictionary': generates a lemma's main dictionary senses up
-//   front (no specific sentence), merged into the same lemma_usages pool.
+// - 'seed_dictionary': generates a lemma's main dictionary usages up
+//   front (no specific sentence). mode 'preview' = generate + strong-model
+//   self-check, nothing saved; mode 'apply' = save the senses the user
+//   picked (code rules re-run). See _shared/prompts/seedDictionary.ts.
+// Usage patterns are always STORED in standard notation (qqn/qqch/inf.,
+// _shared/patternNotation.ts) so the same construction is never two usages.
 // Kept in one file (shared security/budget scaffold, same tables) rather
 // than two -- these are two steps of one feature, unlike analyze-batch vs
 // this function, which are genuinely different AI capabilities.
@@ -16,14 +20,10 @@ import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 import { corsHeaders, jsonResponse } from '../_shared/cors.ts';
 import {
   ANALYZE_RESPONSE_SCHEMA,
-  SEED_DICTIONARY_SYSTEM_PROMPT,
-  SEED_DICTIONARY_RESPONSE_SCHEMA,
   SENTENCE_ANALYSIS_PROMPT_KEY,
   buildUserPrompt,
-  buildSeedDictionaryUserPrompt,
   type AnalyzeAiResult,
   type ExistingLemmaContext,
-  type SeedDictionarySense,
 } from '../_shared/prompts/analyze.ts';
 import {
   shouldSkipAnalysis,
@@ -32,7 +32,6 @@ import {
   shouldPreserveUserAssignedUsage,
   shouldPreserveUserEditedLabel,
   shouldPreserveField,
-  findMergeTargetUsageId,
   shouldRetryAfterSchemaFailure,
 } from '../_shared/lemmaMatching.ts';
 // The sentence-analysis prompt is DB-managed (/admin/prompts, migration
@@ -40,6 +39,21 @@ import {
 import { loadActivePrompt, type LoadedPrompt } from '../_shared/promptLoader.ts';
 import { pickAllowedModel } from '../_shared/promptTemplate.ts';
 import { callOpenAIJsonSchema } from '../_shared/openaiJson.ts';
+import { canonicalizePattern } from '../_shared/patternNotation.ts';
+import {
+  SEED_GENERATE_RESPONSE_SCHEMA,
+  SEED_GENERATE_SYSTEM_PROMPT,
+  SEED_MAX_SENSES,
+  SEED_VERIFY_RESPONSE_SCHEMA,
+  SEED_VERIFY_SYSTEM_PROMPT,
+  buildSeedGenerateUserPrompt,
+  buildSeedVerifyUserPrompt,
+  mergeExamples,
+  prepareSeedSenses,
+  sanitizeSense,
+  type SeedSense,
+  type SeedVerdict,
+} from '../_shared/prompts/seedDictionary.ts';
 
 const SUPABASE_URL = Deno.env.get('SUPABASE_URL')!;
 const SUPABASE_ANON_KEY = Deno.env.get('SUPABASE_ANON_KEY')!;
@@ -50,7 +64,13 @@ const MAX_EXPRESSION_IDS = 20;
 const MAX_SCHEMA_RETRY_ATTEMPTS = 2; // 1 initial try + 1 retry
 const MODEL_PRICING_PER_1M_TOKENS: Record<string, { input: number; output: number }> = {
   'gpt-4o-mini': { input: 0.15, output: 0.6 },
+  'gpt-4.1': { input: 2.0, output: 8.0 },
+  'gpt-4o': { input: 2.5, output: 10.0 },
 };
+// seed_dictionary self-check runs on a stronger model than generation
+// (gpt-4o-mini produced English calques). Override with the secret
+// SEED_VERIFY_MODEL; unknown models are billed at the gpt-4.1 rate.
+const SEED_VERIFY_MODEL = Deno.env.get('SEED_VERIFY_MODEL') ?? 'gpt-4.1';
 
 Deno.serve(async (req) => {
   if (req.method === 'OPTIONS') return new Response('ok', { headers: corsHeaders });
@@ -220,7 +240,79 @@ async function handleClassify(admin: ReturnType<typeof createClient>, userId: st
 async function handleSeedDictionary(admin: ReturnType<typeof createClient>, userId: string, body: Record<string, unknown>) {
   const lemmaId = body.lemmaId as string | undefined;
   if (!lemmaId) return jsonResponse({ error: 'missing_lemma_id' }, 400);
+  const mode = body.mode === 'apply' ? 'apply' : 'preview';
 
+  const { data: lemma } = await admin.from('lemmas').select('id, lemma').eq('id', lemmaId).eq('user_id', userId).maybeSingle();
+  if (!lemma) return jsonResponse({ error: 'lemma_not_found' }, 404);
+
+  const loadExisting = async () => {
+    const { data } = await admin
+      .from('lemma_usages')
+      .select('id, label, pattern, meaning_ko, grammar_explanation_ko, ai_example_sentences, user_edited_fields')
+      .eq('lemma_id', lemmaId);
+    return data ?? [];
+  };
+
+  // ---- apply: save what the user picked from the preview. No AI call; the
+  // code rules run again (the body is client input), then merge/insert.
+  if (mode === 'apply') {
+    const raw = Array.isArray(body.senses) ? body.senses.slice(0, SEED_MAX_SENSES) : [];
+    const senses = raw.map(sanitizeSense).filter((s): s is SeedSense => s !== null);
+    if (senses.length === 0) return jsonResponse({ error: 'no_senses' }, 400);
+    const existing = await loadExisting();
+    const { accepted, rejected } = prepareSeedSenses(senses, null, existing);
+
+    const { count: existingCount } = await admin.from('lemma_usages').select('id', { count: 'exact', head: true }).eq('lemma_id', lemmaId);
+    let sortOrder = existingCount ?? 0;
+    const usageIds: string[] = [];
+    for (const sense of accepted) {
+      if (sense.mergeTargetId) {
+        // Same construction as an existing usage: only ADD examples and fill
+        // empty fields. Label / meaning the learner already has stay as-is.
+        const target = existing.find((u) => u.id === sense.mergeTargetId)!;
+        const update: Record<string, unknown> = {};
+        if (!shouldPreserveField(target.user_edited_fields, 'ai_example_sentences')) {
+          update.ai_example_sentences = mergeExamples(target.ai_example_sentences, sense.examples);
+        }
+        if (!target.meaning_ko && !shouldPreserveField(target.user_edited_fields, 'meaning_ko')) update.meaning_ko = sense.meaning_ko;
+        if (!target.grammar_explanation_ko && !shouldPreserveField(target.user_edited_fields, 'grammar_explanation_ko')) {
+          update.grammar_explanation_ko = sense.grammar_explanation_ko;
+        }
+        if (Object.keys(update).length > 0) await admin.from('lemma_usages').update(update).eq('id', sense.mergeTargetId);
+        usageIds.push(sense.mergeTargetId);
+        continue;
+      }
+      // Plain insert, not upsert: a label collision with a DIFFERENT
+      // construction must fail loudly, never overwrite the other usage.
+      const { data: inserted, error: insertError } = await admin
+        .from('lemma_usages')
+        .insert({
+          user_id: userId,
+          lemma_id: lemmaId,
+          label: sense.label,
+          meaning_ko: sense.meaning_ko,
+          pattern: sense.pattern,
+          required_complement: sense.required_complement,
+          mood_requirement: sense.mood_requirement === 'none' ? null : sense.mood_requirement,
+          grammar_explanation_ko: sense.grammar_explanation_ko,
+          common_mistakes_ko: sense.common_mistakes_ko,
+          ai_example_sentences: sense.examples,
+          source: 'dictionary',
+          sort_order: sortOrder++,
+        })
+        .select('id')
+        .single();
+      if (insertError) {
+        console.warn('[analyze-lemma] seed_dictionary insert skipped', insertError.message);
+        rejected.push({ label: sense.label, pattern: sense.pattern, reason_ko: '같은 이름의 쓰임이 이미 있어 저장하지 못했어요.' });
+      } else if (inserted) {
+        usageIds.push(inserted.id);
+      }
+    }
+    return jsonResponse({ ok: true, usageIds, rejected });
+  }
+
+  // ---- preview: generate -> strong-model self-check -> code rules. Nothing is saved.
   const { data: config } = await admin.from('ai_system_config').select('*').eq('id', true).single();
   if (!config?.ai_enabled) return jsonResponse({ error: 'ai_disabled', message: 'AI 기능이 현재 일시 중지되어 있습니다.' }, 503);
 
@@ -231,104 +323,67 @@ async function handleSeedDictionary(admin: ReturnType<typeof createClient>, user
   try {
     const { data: limits } = await admin.from('ai_rate_limits').select('*').eq('user_id', userId).single();
     if (!limits) return jsonResponse({ error: 'rate_limits_not_provisioned' }, 500);
-
-    const { data: lemma } = await admin.from('lemmas').select('id, lemma').eq('id', lemmaId).eq('user_id', userId).maybeSingle();
-    if (!lemma) return jsonResponse({ error: 'lemma_not_found' }, 404);
-
     const budgetCheck = await checkDailyBudgetAndUsage(admin, userId, config, limits, 1);
     if (budgetCheck.error) return budgetCheck.error;
-
     if (!OPENAI_API_KEY) return jsonResponse({ error: 'openai_key_not_configured' }, 500);
-    const model = limits.allowed_models?.[0] ?? 'gpt-4o-mini';
-    const pricing = MODEL_PRICING_PER_1M_TOKENS[model] ?? MODEL_PRICING_PER_1M_TOKENS['gpt-4o-mini'];
 
-    let senses: SeedDictionarySense[] = [];
+    const model = limits.allowed_models?.[0] ?? 'gpt-4o-mini';
+    let totalCost = 0;
+    const account = async (m: string, inputTokens: number, outputTokens: number) => {
+      const pricing = MODEL_PRICING_PER_1M_TOKENS[m] ?? MODEL_PRICING_PER_1M_TOKENS['gpt-4.1'];
+      const cost = (inputTokens / 1_000_000) * pricing.input + (outputTokens / 1_000_000) * pricing.output;
+      totalCost += cost;
+      await settleUsageLog(admin, userId, m, inputTokens, outputTokens, cost);
+    };
+
+    let generated: SeedSense[] = [];
     let lastError: string | null = null;
-    let inputTokens = 0;
-    let outputTokens = 0;
     for (let attempt = 0; attempt < MAX_SCHEMA_RETRY_ATTEMPTS; attempt++) {
       try {
-        const completion = await callSeedDictionaryOpenAI(lemma.lemma, model);
-        senses = completion.result;
-        inputTokens = completion.inputTokens;
-        outputTokens = completion.outputTokens;
+        const payload = await callOpenAIJsonSchema({
+          apiKey: OPENAI_API_KEY,
+          systemPrompt: SEED_GENERATE_SYSTEM_PROMPT,
+          userPrompt: buildSeedGenerateUserPrompt(lemma.lemma),
+          model,
+          schema: SEED_GENERATE_RESPONSE_SCHEMA,
+          schemaName: 'seed_dictionary',
+          maxOutputTokens: 2500,
+        });
+        await account(model, payload.inputTokens, payload.outputTokens);
+        generated = ((payload.parsed as { senses: unknown[] }).senses ?? []).map(sanitizeSense).filter((s): s is SeedSense => s !== null);
+        lastError = null;
         break;
       } catch (err) {
         lastError = err instanceof Error ? err.message : String(err);
-        console.error('[analyze-lemma] seed_dictionary attempt failed', lemma.lemma, lastError);
+        console.error('[analyze-lemma] seed generate failed', lastError);
         if (!shouldRetryAfterSchemaFailure(attempt, MAX_SCHEMA_RETRY_ATTEMPTS - 1)) break;
       }
     }
-    if (senses.length === 0 && lastError) {
-      return jsonResponse({ error: 'openai_call_failed', message: lastError }, 502);
+    if (lastError) return jsonResponse({ error: 'openai_call_failed', message: lastError }, 502);
+
+    // Self-check with the stronger model. Fail closed: no verdicts -> nothing offered.
+    let verdicts: SeedVerdict[];
+    try {
+      const payload = await callOpenAIJsonSchema({
+        apiKey: OPENAI_API_KEY,
+        systemPrompt: SEED_VERIFY_SYSTEM_PROMPT,
+        userPrompt: buildSeedVerifyUserPrompt(lemma.lemma, generated),
+        model: SEED_VERIFY_MODEL,
+        schema: SEED_VERIFY_RESPONSE_SCHEMA,
+        schemaName: 'seed_verify',
+        maxOutputTokens: 3000,
+        temperature: 0,
+      });
+      await account(SEED_VERIFY_MODEL, payload.inputTokens, payload.outputTokens);
+      verdicts = (payload.parsed as { verdicts: SeedVerdict[] }).verdicts;
+    } catch (err) {
+      console.error('[analyze-lemma] seed verify failed', err instanceof Error ? err.message : err);
+      return jsonResponse({ error: 'verification_failed', message: '검증 단계가 실패해서 아무것도 추가하지 않았어요.' }, 502);
     }
 
-    const { data: existingUsages } = await admin
-      .from('lemma_usages')
-      .select('id, pattern, user_edited_fields, label_user_edited')
-      .eq('lemma_id', lemmaId);
-
-    const { count: existingCount } = await admin.from('lemma_usages').select('id', { count: 'exact', head: true }).eq('lemma_id', lemmaId);
-    let sortOrder = existingCount ?? 0;
-    const usageIds: string[] = [];
-
-    for (const sense of senses) {
-      const mergeTargetId = findMergeTargetUsageId(sense.pattern, (existingUsages ?? []).map((u) => ({ id: u.id, pattern: u.pattern })));
-
-      if (mergeTargetId) {
-        const target = (existingUsages ?? []).find((u) => u.id === mergeTargetId)!;
-        const update: Record<string, unknown> = {};
-        if (!shouldPreserveUserEditedLabel(target)) update.label = sense.label;
-        if (!shouldPreserveField(target.user_edited_fields, 'meaning_ko')) update.meaning_ko = sense.meaning_ko;
-        if (!shouldPreserveField(target.user_edited_fields, 'required_complement')) update.required_complement = sense.required_complement;
-        if (!shouldPreserveField(target.user_edited_fields, 'mood_requirement')) update.mood_requirement = sense.mood_requirement;
-        if (!shouldPreserveField(target.user_edited_fields, 'grammar_explanation_ko')) update.grammar_explanation_ko = sense.grammar_explanation_ko;
-        if (!shouldPreserveField(target.user_edited_fields, 'common_mistakes_ko')) update.common_mistakes_ko = sense.common_mistakes_ko;
-        if (!shouldPreserveField(target.user_edited_fields, 'ai_example_sentences')) {
-          update.ai_example_sentences = [{ fr: sense.example_fr, ko: sense.example_ko }];
-        }
-        if (Object.keys(update).length > 0) {
-          await admin.from('lemma_usages').update(update).eq('id', mergeTargetId);
-        }
-        usageIds.push(mergeTargetId);
-      } else {
-        // Plain insert, not upsert: the (lemma_id, label) unique constraint
-        // must never silently merge a DIFFERENT pattern into an existing
-        // row just because the AI happened to pick the same short label --
-        // that is exactly the "wrongly merged into an unrelated usage" bug
-        // this migration fixes. A genuine label collision fails loudly
-        // (logged, sense skipped) instead of overwriting the wrong row.
-        const { data: inserted, error: insertError } = await admin
-          .from('lemma_usages')
-          .insert({
-            user_id: userId,
-            lemma_id: lemmaId,
-            label: sense.label,
-            meaning_ko: sense.meaning_ko,
-            pattern: sense.pattern,
-            required_complement: sense.required_complement,
-            mood_requirement: sense.mood_requirement === 'none' ? null : sense.mood_requirement,
-            grammar_explanation_ko: sense.grammar_explanation_ko,
-            common_mistakes_ko: sense.common_mistakes_ko,
-            ai_example_sentences: [{ fr: sense.example_fr, ko: sense.example_ko }],
-            source: 'dictionary',
-            sort_order: sortOrder++,
-          })
-          .select('id')
-          .single();
-        if (insertError) {
-          console.warn('[analyze-lemma] seed_dictionary sense insert skipped', sense.label, insertError.message);
-        } else if (inserted) {
-          usageIds.push(inserted.id);
-        }
-      }
-    }
-
-    const estimatedCost = (inputTokens / 1_000_000) * pricing.input + (outputTokens / 1_000_000) * pricing.output;
-    await settleUsageLog(admin, userId, model, inputTokens, outputTokens, estimatedCost);
-    await admin.rpc('increment_ai_usage', { p_user_id: userId, p_cost_usd: estimatedCost, p_expression_analyses: 1 });
-
-    return jsonResponse({ ok: true, senseCount: senses.length, usageIds });
+    const { accepted, rejected } = prepareSeedSenses(generated, verdicts, await loadExisting());
+    await admin.rpc('increment_ai_usage', { p_user_id: userId, p_cost_usd: totalCost, p_expression_analyses: 1 });
+    return jsonResponse({ ok: true, senses: accepted, rejected, models: { generate: model, verify: SEED_VERIFY_MODEL } });
   } finally {
     await admin.from('ai_active_requests').delete().eq('user_id', userId);
   }
@@ -426,7 +481,7 @@ async function applyClassifyResult(
             lemma_id: lemmaId,
             label: ai.usage.label,
             meaning_ko: ai.usage.meaning_ko,
-            pattern: ai.usage.pattern,
+            pattern: canonicalizePattern(ai.usage.pattern),
             source: 'learned',
             sort_order: count ?? 0,
           },
@@ -443,7 +498,7 @@ async function applyClassifyResult(
       const update: Record<string, unknown> = {};
       if (!shouldPreserveUserEditedLabel(existingUsage)) update.label = ai.usage.label;
       if (!shouldPreserveField(existingUsage?.user_edited_fields, 'meaning_ko')) update.meaning_ko = ai.usage.meaning_ko;
-      if (!shouldPreserveField(existingUsage?.user_edited_fields, 'pattern')) update.pattern = ai.usage.pattern;
+      if (!shouldPreserveField(existingUsage?.user_edited_fields, 'pattern')) update.pattern = canonicalizePattern(ai.usage.pattern);
       if (Object.keys(update).length > 0) {
         await admin.from('lemma_usages').update(update).eq('id', usageId);
       }
@@ -499,17 +554,4 @@ async function callClassifyOpenAI(
     temperature: prompt.temperature,
   });
   return { result: payload.parsed as AnalyzeAiResult, inputTokens: payload.inputTokens, outputTokens: payload.outputTokens };
-}
-
-async function callSeedDictionaryOpenAI(lemma: string, model: string): Promise<{ result: SeedDictionarySense[]; inputTokens: number; outputTokens: number }> {
-  const payload = await callOpenAIJsonSchema({
-    apiKey: OPENAI_API_KEY!,
-    systemPrompt: SEED_DICTIONARY_SYSTEM_PROMPT,
-    userPrompt: buildSeedDictionaryUserPrompt(lemma),
-    model,
-    schema: SEED_DICTIONARY_RESPONSE_SCHEMA,
-    schemaName: 'seed_dictionary',
-    maxOutputTokens: 2500,
-  });
-  return { result: (payload.parsed as { senses: SeedDictionarySense[] }).senses, inputTokens: payload.inputTokens, outputTokens: payload.outputTokens };
 }

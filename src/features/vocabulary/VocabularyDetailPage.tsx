@@ -3,7 +3,7 @@ import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { supabase } from '@/lib/supabase';
 import { useAuth } from '@/contexts/AuthContext';
-import { seedLemmaDictionary } from '@/features/vocabulary/lemmaClient';
+import { SeedDictionaryPanel } from '@/features/vocabulary/SeedDictionaryPanel';
 import { useVocabularyData, VOCABULARY_QUERY_KEY } from '@/features/vocabulary/useVocabularyData';
 import { complementLabelFr, complementLabelKo, posLabel, registerLabel } from '@/lib/grammarTerms';
 import { speakFrench, youglishUrl } from '@/lib/speech';
@@ -140,15 +140,6 @@ export default function VocabularyDetailPage() {
     },
     onSuccess: invalidate,
     onError: (err) => setActionError(err instanceof Error ? err.message : String(err)),
-  });
-
-  const seed = useMutation({
-    mutationFn: async () => {
-      const outcome = await seedLemmaDictionary(lemmaId!);
-      if (outcome.status === 'failed') throw new Error(outcome.error ?? 'unknown_error');
-    },
-    onSettled: invalidate,
-    onError: (err) => setActionError(`사전 쓰임 생성 실패: ${err instanceof Error ? err.message : String(err)}`),
   });
 
   useEffect(() => {
@@ -383,15 +374,7 @@ export default function VocabularyDetailPage() {
           </div>
         )}
 
-        {!usageDetails.some((u) => u.source === 'dictionary') && (
-          <button
-            onClick={() => seed.mutate()}
-            disabled={seed.isPending}
-            className="mt-3 w-full rounded-full border border-slate-300 py-2 text-xs text-slate-500 disabled:opacity-40 dark:border-slate-700"
-          >
-            {seed.isPending ? '사전 쓰임 생성 중...' : '사전 쓰임 추가 (AI)'}
-          </button>
-        )}
+        {!usageDetails.some((u) => u.source === 'dictionary') && <SeedDictionaryPanel lemmaId={lemma.id} onSaved={invalidate} />}
       </Accordion>
 
       {/* D. 활용표 */}
