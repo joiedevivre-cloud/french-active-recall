@@ -1,7 +1,12 @@
 import { supabase } from '@/lib/supabase';
 import type { BatchItemResult, DetailedBatchItemResult } from '@/features/ai-batch/aiBatchClient';
 
-export const DETAILED_ANALYSIS_VERSION = 'detailed-v1';
+// v2: added core_pattern (multi-word idiomatic/semi-auxiliary pattern
+// recognition, e.g. "se mettre à + infinitif") as the primary field --
+// v1's sentence_structure only fit subordinate-clause sentences, so a
+// sentence like "Je me suis mise à chercher..." got nothing but a
+// word-by-word vocabulary breakdown. See README "AI 분석 품질".
+export const DETAILED_ANALYSIS_VERSION = 'detailed-v2';
 
 function isDetailedResult(result: BatchItemResult | DetailedBatchItemResult): result is DetailedBatchItemResult {
   return 'sentence_structure' in result;
@@ -64,6 +69,7 @@ export async function applyAnalysisResult(
 
   if (isDetailedResult(result)) {
     update.detailed_analysis = {
+      core_pattern: result.core_pattern,
       sentence_structure: result.sentence_structure,
       grammar_points: result.grammar_points,
       vocabulary: result.vocabulary,

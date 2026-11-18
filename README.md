@@ -155,12 +155,38 @@ Edge Function(`supabase/functions/analyze-batch`)은 `analyze-expression`과
 - 기본정보(원문/뜻/CEFR(AI 추정 명시)/🔊 발음(`speechSynthesis`, `fr-CA` 우선
   → 없으면 `fr-FR`)/즐겨찾기/출처/마지막 분석 시간)
 - **[상세 분석 만들기]/[AI 다시 분석]** 버튼 → `analyze-batch`를 `detailed:
-  true`로 호출(문장 1개 한정, 서버가 강제). 성공하면 문장구조/핵심문법/
-  단어별 설명/흔한 실수/헷갈리는 표현/응용예문 2개가 `expressions.
-  detailed_analysis`(jsonb)에 저장되고, **다음부터는 저장된 값만 읽는다**
-  (화면 열 때마다 재호출 안 함)
+  true`로 호출(문장 1개 한정, 서버가 강제). 성공하면 **핵심 패턴**(v2,
+  아래 참고)/문장구조/핵심문법/단어별 설명/흔한 실수/헷갈리는 표현/응용
+  예문 2개가 `expressions.detailed_analysis`(jsonb)에 저장되고, **다음부터는
+  저장된 값만 읽는다**(화면 열 때마다 재호출 안 함)
 - 사용자가 직접 고친 `meaning_ko`는 `meaning_ko_user_edited` 플래그로
   보호되어 재분석이 덮어쓰지 않음(다른 필드는 정상 갱신)
+
+### AI 분석 품질 개선 (v2: `core_pattern`)
+
+**문제**: `Je me suis mise à chercher un nouvel emploi.` 같은 문장에서 v1
+분석이 `chercher`/`nouvel`만 단어별로 설명하고 핵심 문법(`se mettre à +
+infinitif`, 대명동사, 복합과거 `être` 조동사, 과거분사 성·수 일치)을
+놓치는 문제가 확인됨. **원인**: v1 스키마의 1순위 필드 `sentence_structure`가
+종속절 중심(`il faut que + 접속법`류)이라 종속절이 없는 문장에는 맞는
+구조가 없었고, 멀티워드 숙어/반조동사 패턴을 담을 전용 필드가 없어서
+결과가 단어별 설명(`vocabulary`)으로 쏠렸다.
+
+**수정**: 새 1순위 필드 `core_pattern`(모든 문장에 적용, 종속절 유무
+무관) 추가 — `pattern`/`meaning_ko`/`matched_form`/`explanation_ko`.
+시스템 프롬프트에 지시서의 멀티워드 패턴 목록(se mettre à, avoir beau,
+venir de, être en train de 등)을 명시하고 "삽입어가 있어도 인식" 지시
+추가. `grammar_points` 프롬프트도 강화(조동사 선택/과거분사 일치/전치사
+이유 등을 실제 문장에 있을 때만 설명), `vocabulary`는 `core_pattern`/
+`grammar_points`에서 이미 설명한 단어를 중복 설명하지 않도록 지시.
+`analysis_version`을 `detailed-v1` → `detailed-v2`로 bump(이 컬럼은
+CHECK 제약이 없는 평범한 text라 **마이그레이션 불필요**). 기존
+`detailed-v1` 캐시 행은 `core_pattern` 없이 그대로 렌더링됨(하위 호환,
+`[AI 다시 분석]`을 눌러야 v2로 갱신). 스키마 상수/토큰 추정 로직은
+`supabase/functions/_shared/detailedAnalysisSchema.ts`로 분리(Deno/
+Vitest 양쪽에서 같은 파일 import, `lemmaMatching.ts`와 동일 패턴).
+`DETAILED_TOKENS_PER_ITEM_ESTIMATE`도 1800→2200으로 상향(새 필드로 출력
+증가, 토큰 절단 버그 재발 방지).
 
 **분석 상태 머신** (`src/features/ai-batch/staleAnalysis.ts`): `pending`(요청
 없음) / `analyzing`(진행중, `analysis_requested_at` 기록) / 90초 넘으면
@@ -257,6 +283,17 @@ Switch)를 통과하기 전에는 실제 OpenAI 키를 연결하지 않는다.**
    `SUPABASE_SERVICE_ROLE_KEY`/`OPENAI_API_KEY` 추가 후
    `npm run backfill:analysis -- --dry-run`으로 개수 확인 → `npm run
    backfill:analysis`로 실행
+10. **AI 분석 품질 v2 배포**: `supabase functions deploy analyze-batch
+    --remote=xwbcpanispdyrchddnzi` 후, 아래 8문장으로 실제 분석 품질 직접
+    확인 (마이그레이션 불필요 — `analysis_version` 컬럼에 CHECK 제약 없음):
+    1. `Je me suis mise à chercher un nouvel emploi.`
+    2. `Il faut que je mette à jour mon profil.`
+    3. `J'ai beau étudier, je fais encore des erreurs.`
+    4. `Je me rends compte que je fais des progrès.`
+    5. `Elle a du mal à se confier aux autres.`
+    6. `Je ne savais pas qu'il fallait remplir ce formulaire.`
+    7. `J'aurais aimé être prévenue plus tôt.`
+    8. `Il faut que nous mettions nos idées en commun.`
 
 ## 테스트 결과
 
@@ -264,7 +301,12 @@ Switch)를 통과하기 전에는 실제 OpenAI 키를 연결하지 않는다.**
 
 - `npm run typecheck` — 통과
 - `npm run build` — 통과 (더미 env로 로컬 빌드, 번들에 비밀키 누출 없음 확인)
-- `npm test` (`vitest`) — **107개 테스트 통과** (전부 모킹 기반, 실제 OpenAI/Supabase 네트워크 호출 없음)
+- `npm test` (`vitest`) — **115개 테스트 통과** (전부 모킹 기반, 실제 OpenAI/Supabase 네트워크 호출 없음)
+  - `detailedAnalysisSchema.test.ts` (8개, 신규): `analyze-batch`가 실제로
+    쓰는 `supabase/functions/_shared/detailedAnalysisSchema.ts`를 그대로
+    import — strict 스키마 모양(필수필드=전체 property, `additionalProperties:
+    false`), v2 `core_pattern` 필드 존재/nullable, v1 필드 전부 보존,
+    `computeMaxOutputTokens` 상향된 추정치 경계값(토큰 절단 버그 재발 방지)
   - `lemmaMatching.test.ts` (14개): `analyze-lemma`가 실제로 쓰는
     `supabase/functions/_shared/lemmaMatching.ts`를 그대로 import해서
     테스트(별도 재구현 아님) — 캐시 히트→AI 호출 스킵, 존재하지 않는/
@@ -304,11 +346,14 @@ Switch)를 통과하기 전에는 실제 OpenAI 키를 연결하지 않는다.**
   **부분 검증됨** — 토큰 절단 수정(Phase 0)은 실제 로그로 성공 확인했으나,
   이번에 추가한 **상세 분석(`detailed: true`) 경로는 아직 실제 호출로
   검증 못함**. 아래 "실제 Supabase/OpenAI 연동 검증" 참고
-- **`analyze-lemma`(단어장) Edge Function은 전혀 호출된 적 없음** —
-  로그인 세션이 없어 제가 직접 호출할 방법이 없음(기존 제약과 동일).
-  코드 리뷰만 했고, Deno 런타임에서 실행해본 적도 없음(로컬에 Deno
-  CLI 없음, `supabase functions deploy`도 아직 안 함) — 실제 배포+호출
-  검증은 아래 "사용자가 할 일" 참고
+- **`analyze-lemma`(단어장) Edge Function**: 마이그레이션 0014 적용 및
+  배포(`status: ACTIVE`)는 읽기 전용 쿼리로 제가 직접 확인함. **실제
+  사용자 호출로 쓰임 분류가 정확히 나오는지는 아직 미검증** — 로그인
+  세션이 없어 제가 직접 호출 불가.
+- **AI 분석 품질 v2(`core_pattern`)는 전혀 호출된 적 없음** — 스키마
+  모양만 테스트했고, 지시서의 8문장으로 실제 분석 품질(핵심 패턴/문법
+  설명 정확도)은 **사용자가 직접 확인해야 함**(아래 "사용자가 할 일"
+  10번). 스키마 통과 ≠ 분석 내용 정확성.
 
 ### 수동 (사용자 환경에서만 가능 — 미검증)
 

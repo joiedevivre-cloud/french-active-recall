@@ -57,6 +57,7 @@ function fakeResult(expressionFr: string): BatchItemResult {
 function fakeDetailedResult(expressionFr: string): DetailedBatchItemResult {
   return {
     ...fakeResult(expressionFr),
+    core_pattern: null,
     sentence_structure: null,
     grammar_points: [{ pattern: 'il faut que + subjonctif', meaning: '필요성 표현', example: 'Il faut que tu partes.' }],
     vocabulary: [],

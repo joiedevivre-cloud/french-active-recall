@@ -15,39 +15,19 @@
 // function's environment.
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 import { corsHeaders, jsonResponse } from '../_shared/cors.ts';
+import {
+  MAX_CHUNK_SIZE,
+  MAX_DETAILED_SENTENCES,
+  computeMaxOutputTokens,
+  LIGHT_RESULT_ITEM_SCHEMA,
+  DETAILED_RESULT_ITEM_SCHEMA,
+  buildResponseSchema,
+} from '../_shared/detailedAnalysisSchema.ts';
 
 const SUPABASE_URL = Deno.env.get('SUPABASE_URL')!;
 const SUPABASE_ANON_KEY = Deno.env.get('SUPABASE_ANON_KEY')!;
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
 const OPENAI_API_KEY = Deno.env.get('OPENAI_API_KEY');
-
-const MAX_CHUNK_SIZE = 20;
-
-// Each result item carries ~9 fields of Korean/French text. A FIXED
-// max_tokens regardless of chunk size (the old bug: always 1024,
-// whatever ai_rate_limits.max_output_tokens said) meant any chunk bigger
-// than ~3-4 sentences could never finish within budget -- OpenAI stops
-// generating mid-string (finish_reason: 'length') and the truncated text
-// is simply not valid JSON. This is a generous-but-bounded per-item
-// estimate, not a tight one; MAX_TOTAL_OUTPUT_TOKENS is a hard ceiling
-// independent of whatever a user's ai_rate_limits row says, so a
-// misconfigured/very high row can never request an enormous completion.
-const TOKENS_PER_ITEM_ESTIMATE = 350;
-// The detailed (sentence_structure/grammar_points/vocabulary/
-// common_mistakes/similar_expressions/example_sentences) schema is far
-// bigger per item -- gated to exactly 1 sentence per request (see
-// MAX_DETAILED_SENTENCES below) specifically so this large per-item cost
-// never has to multiply across a chunk.
-const DETAILED_TOKENS_PER_ITEM_ESTIMATE = 1800;
-const OUTPUT_TOKEN_OVERHEAD = 200;
-const MAX_TOTAL_OUTPUT_TOKENS = 4000;
-const MAX_DETAILED_SENTENCES = 1;
-
-function computeMaxOutputTokens(sentenceCount: number, configuredCeiling: number, detailed: boolean): number {
-  const perItem = detailed ? DETAILED_TOKENS_PER_ITEM_ESTIMATE : TOKENS_PER_ITEM_ESTIMATE;
-  const estimated = sentenceCount * perItem + OUTPUT_TOKEN_OVERHEAD;
-  return Math.min(estimated, MAX_TOTAL_OUTPUT_TOKENS, configuredCeiling);
-}
 
 // Approximate OpenAI pricing (USD per 1M tokens). VERIFY against
 // https://openai.com/api/pricing -- this is only as accurate as the last
@@ -91,143 +71,25 @@ interface VocabularyItem {
   common_mistake: string | null;
 }
 
+// v2: the primary field for detailed analysis, catching multi-word
+// idiomatic/semi-auxiliary patterns (se mettre à + infinitif, avoir beau +
+// infinitif, etc.) that sentence_structure (clause-based) and a
+// word-by-word vocabulary breakdown both miss -- see README "AI 분석 품질".
+interface CorePattern {
+  pattern: string;
+  meaning_ko: string;
+  matched_form: string;
+  explanation_ko: string;
+}
+
 interface DetailedBatchItemResult extends BatchItemResult {
+  core_pattern: CorePattern | null;
   sentence_structure: SentenceStructure | null;
   grammar_points: { pattern: string; meaning: string; example: string }[];
   vocabulary: VocabularyItem[];
   common_mistakes: string[];
   similar_expressions: { a: string; b: string; difference: string }[];
   example_sentences: { fr: string; ko: string }[];
-}
-
-const LIGHT_RESULT_ITEM_SCHEMA = {
-  type: 'object',
-  properties: {
-    expression_fr: { type: 'string' },
-    corrected_fr: { type: ['string', 'null'] },
-    meaning_ko: { type: 'string' },
-    grammar_note: { type: 'string' },
-    example_fr: { type: 'string' },
-    example_translation_ko: { type: 'string' },
-    cefr_level: { type: 'string', enum: ['A1', 'A2', 'B1', 'B2', 'C1', 'C2'] },
-    tags: { type: 'array', items: { type: 'string' } },
-    key_phrase: { type: 'string' },
-  },
-  required: [
-    'expression_fr',
-    'corrected_fr',
-    'meaning_ko',
-    'grammar_note',
-    'example_fr',
-    'example_translation_ko',
-    'cefr_level',
-    'tags',
-    'key_phrase',
-  ],
-  additionalProperties: false,
-};
-
-// Only used when detailed=true (see below) -- a SINGLE sentence at a time.
-// Deliberately NOT part of the light/bulk schema: every field here adds a
-// lot of Korean-heavy output, and this is exactly the kind of per-item
-// cost growth that caused the max_tokens truncation bug when it was
-// implicitly applied to a whole multi-sentence chunk. Keeping this gated
-// to one sentence per request means the token budget never has to scale
-// with chunk size for this schema at all.
-const SENTENCE_STRUCTURE_SCHEMA = {
-  type: ['object', 'null'],
-  properties: {
-    main_clause: { type: 'string' },
-    conjunction: { type: 'string' },
-    subordinate_clause: { type: 'string' },
-    core_structure: { type: 'string' },
-    infinitive: { type: 'string' },
-    conjugated_form: { type: 'string' },
-    mood_explanation: { type: 'string' },
-    mood_contrast: { type: 'string' },
-    overall_meaning: { type: 'string' },
-  },
-  required: [
-    'main_clause',
-    'conjunction',
-    'subordinate_clause',
-    'core_structure',
-    'infinitive',
-    'conjugated_form',
-    'mood_explanation',
-    'mood_contrast',
-    'overall_meaning',
-  ],
-  additionalProperties: false,
-};
-
-const VOCABULARY_ITEM_SCHEMA = {
-  type: 'object',
-  properties: {
-    word: { type: 'string' },
-    part_of_speech: { type: 'string' },
-    meaning_ko: { type: 'string' },
-    infinitive: { type: ['string', 'null'] },
-    tense_or_conjugation: { type: ['string', 'null'] },
-    gender_agreement: { type: ['string', 'null'] },
-    preposition: { type: ['string', 'null'] },
-    common_mistake: { type: ['string', 'null'] },
-  },
-  required: ['word', 'part_of_speech', 'meaning_ko', 'infinitive', 'tense_or_conjugation', 'gender_agreement', 'preposition', 'common_mistake'],
-  additionalProperties: false,
-};
-
-const GRAMMAR_POINT_SCHEMA = {
-  type: 'object',
-  properties: { pattern: { type: 'string' }, meaning: { type: 'string' }, example: { type: 'string' } },
-  required: ['pattern', 'meaning', 'example'],
-  additionalProperties: false,
-};
-
-const SIMILAR_EXPRESSION_SCHEMA = {
-  type: 'object',
-  properties: { a: { type: 'string' }, b: { type: 'string' }, difference: { type: 'string' } },
-  required: ['a', 'b', 'difference'],
-  additionalProperties: false,
-};
-
-const EXAMPLE_SENTENCE_SCHEMA = {
-  type: 'object',
-  properties: { fr: { type: 'string' }, ko: { type: 'string' } },
-  required: ['fr', 'ko'],
-  additionalProperties: false,
-};
-
-const DETAILED_RESULT_ITEM_SCHEMA = {
-  type: 'object',
-  properties: {
-    ...LIGHT_RESULT_ITEM_SCHEMA.properties,
-    sentence_structure: SENTENCE_STRUCTURE_SCHEMA,
-    grammar_points: { type: 'array', items: GRAMMAR_POINT_SCHEMA },
-    vocabulary: { type: 'array', items: VOCABULARY_ITEM_SCHEMA },
-    common_mistakes: { type: 'array', items: { type: 'string' } },
-    similar_expressions: { type: 'array', items: SIMILAR_EXPRESSION_SCHEMA },
-    example_sentences: { type: 'array', items: EXAMPLE_SENTENCE_SCHEMA },
-  },
-  required: [
-    ...LIGHT_RESULT_ITEM_SCHEMA.required,
-    'sentence_structure',
-    'grammar_points',
-    'vocabulary',
-    'common_mistakes',
-    'similar_expressions',
-    'example_sentences',
-  ],
-  additionalProperties: false,
-};
-
-function buildResponseSchema(itemSchema: unknown) {
-  return {
-    type: 'object',
-    properties: { results: { type: 'array', items: itemSchema } },
-    required: ['results'],
-    additionalProperties: false,
-  };
 }
 
 Deno.serve(async (req) => {
@@ -434,14 +296,29 @@ For EACH input sentence, in the SAME ORDER, produce one result object with:
 - tags: 1-3 short topic/grammar tags in Korean or French (e.g. "접속법", "일상 회화").
 - key_phrase: the single core phrase/pattern from this sentence most worth memorizing (e.g. "penser à", "il faut que + subjonctif").`;
 
+// v2: core_pattern is now the PRIMARY thing to find, before any word-by-word
+// breakdown -- the v1 prompt let the model default to explaining 2-3 easy
+// words (e.g. "chercher", "nouvel") while missing the actual grammar that
+// matters (e.g. "se mettre à + infinitif" in "Je me suis mise à chercher un
+// nouvel emploi."), because sentence_structure only fit subordinate-clause
+// sentences and nothing else was positioned as "the main thing to explain."
+const KNOWN_MULTIWORD_PATTERNS = [
+  'se mettre à + infinitif', 'se rendre compte que', 'avoir beau + infinitif',
+  'il faut que + subjonctif', 'penser à + infinitif', 'penser de quelque chose',
+  'avoir du mal à + infinitif', 'venir de + infinitif', 'être en train de + infinitif',
+  'mettre à jour', 'mettre en place', "se confier à quelqu'un",
+  'faire en sorte que + subjonctif',
+].join(', ');
+
 const DETAILED_SYSTEM_PROMPT_EXTRA = `
 You are also asked for a deeper B1~B2 breakdown of this ONE sentence, for all the fields above PLUS:
-- sentence_structure: if the sentence has a main clause + subordinate clause (e.g. "il faut que + subjonctif"), fill in main_clause, conjunction, subordinate_clause, core_structure, infinitive (the subordinate verb's infinitive, or "" if none), conjugated_form (the actual conjugated form used, or "" if none), mood_explanation (Korean: why this mood -- subjunctive/indicative/etc. -- is used here), mood_contrast (Korean: how the meaning would differ with the other mood, or "" if not applicable), overall_meaning (Korean: a natural reading of the whole sentence). If the input is just a word/short phrase with no clause structure, set sentence_structure to null -- do not force a breakdown that doesn't apply.
-- grammar_points: 1 to 3 objects {pattern, meaning, example}, most useful first -- the actual grammar patterns present (tense/mood, structures like "avoir beau + infinitif", pronouns, negation). meaning is a Korean explanation anchored in THIS sentence, not a generic textbook definition. example is a different French sentence using the same pattern.
-- vocabulary: 0 to 6 objects for words/short expressions genuinely worth explaining (skip articles and trivial words -- "모든 관사와 쉬운 단어를 기계적으로 설명하지 않기"). Each: {word, part_of_speech, meaning_ko, infinitive (verb's dictionary form, or null), tense_or_conjugation (or null), gender_agreement (or null), preposition (preposition this word pairs with, or null), common_mistake (a mistake Korean learners often make with this word, or null)}.
-- common_mistakes: 0 to 3 short Korean strings about mistakes Korean learners commonly make with THIS sentence/expression as a whole (separate from per-word ones already in vocabulary). Empty array if none stand out.
+- core_pattern: FIND THIS FIRST, before anything else below. Almost every sentence has ONE dominant grammatical pattern or multi-word idiomatic/semi-auxiliary construction that a Korean learner must recognize to understand and reuse the sentence -- this is usually MORE important than any single word. Recognize it even when conjugated/inflected and even when other words are inserted between its parts (e.g. "se mettre à" realized as "je me suis mise à chercher" -- the pattern is still "se mettre à + infinitif", matched_form is "me suis mise à chercher"). Known examples (not exhaustive -- recognize others too): ${KNOWN_MULTIWORD_PATTERNS}. Fill in: pattern (canonical/dictionary form), meaning_ko (short Korean gloss), matched_form (the exact text in THIS sentence that realizes it), explanation_ko (Korean: why this form is used here). Set to null ONLY if the sentence genuinely has no dominant pattern (e.g. a single simple noun phrase) -- this should be rare.
+- sentence_structure: ONLY if the sentence additionally has a main clause + subordinate clause (e.g. "il faut que + subjonctif"), fill in main_clause, conjunction, subordinate_clause, core_structure, infinitive (the subordinate verb's infinitive, or "" if none), conjugated_form (the actual conjugated form used, or "" if none), mood_explanation (Korean: why this mood -- subjunctive/indicative/etc. -- is used here), mood_contrast (Korean: how the meaning would differ with the other mood, or "" if not applicable), overall_meaning (Korean: a natural reading of the whole sentence). Most sentences WITHOUT a subordinate clause should set this to null -- it is secondary to core_pattern, not a duplicate of it.
+- grammar_points: 1 to 3 objects {pattern, meaning, example}, most useful first, covering whichever of these actually apply to THIS sentence (skip ones that don't apply -- never pad): which auxiliary (avoir/être) a compound-tense verb uses and why; past-participle gender/number agreement, giving BOTH the masculine and feminine form when the subject's gender affects it (e.g. "mis (남성) / mise (여성)"); the role of any reflexive/object/relative pronoun; why a specific preposition is used; elision/liaison-driven word forms (e.g. "nouvel" before a vowel-initial masculine noun, instead of "nouveau"). meaning is a Korean explanation anchored in THIS sentence's actual words, not a generic textbook definition. example is a different French sentence using the same point.
+- vocabulary: 0 to 6 objects for words/short expressions genuinely worth explaining ON THEIR OWN, skipping anything already explained by core_pattern or grammar_points above (never explain the same word twice) and skipping articles/trivial words. Each: {word, part_of_speech, meaning_ko, infinitive (verb's dictionary form, or null), tense_or_conjugation (or null), gender_agreement (or null), preposition (preposition this word pairs with, or null), common_mistake (a mistake Korean learners often make with this word, or null)}.
+- common_mistakes: 0 to 3 short Korean strings about mistakes Korean learners commonly make with THIS sentence/expression as a whole (separate from core_pattern/grammar_points/vocabulary -- e.g. wrong gender agreement, missing "à", wrong verb form). Empty array if none stand out.
 - similar_expressions: 0 to 3 objects {a, b, difference} ONLY for expressions genuinely easy to confuse with something in this sentence (e.g. "penser à" / "penser de", "depuis" / "pendant"). difference is a short Korean explanation. Return an empty array rather than inventing a comparison that isn't real.
-- example_sentences: EXACTLY 2 objects {fr, ko} -- new natural French example sentences reusing this sentence's key expression/structure, set in everyday Quebec life, at B1 level. Do not invent facts about a specific person; keep them generic.`;
+- example_sentences: EXACTLY 2 objects {fr, ko} -- new natural French example sentences reusing this sentence's key pattern/structure, set in everyday Quebec life, at B1 level. Do not invent facts about a specific person; keep them generic.`;
 
 async function callOpenAI(
   sentences: string[],

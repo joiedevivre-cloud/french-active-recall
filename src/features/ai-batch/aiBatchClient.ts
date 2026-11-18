@@ -45,6 +45,19 @@ export interface VocabularyItem {
 }
 
 /**
+ * v2: the PRIMARY field of a detailed analysis -- catches multi-word
+ * idiomatic/semi-auxiliary patterns (se mettre à + infinitif, avoir beau +
+ * infinitif, etc.) that sentence_structure (clause-based only) and a
+ * word-by-word vocabulary breakdown both miss. See README "AI 분석 품질".
+ */
+export interface CorePattern {
+  pattern: string;
+  meaning_ko: string;
+  matched_form: string;
+  explanation_ko: string;
+}
+
+/**
  * Only returned when a request sets `detailed: true` (exactly one
  * sentence per request -- see analyzeDetailed). Deliberately NOT part of
  * the bulk/auto-trigger path: this schema's per-item output is far larger,
@@ -52,6 +65,7 @@ export interface VocabularyItem {
  * cost growth that caused the max_tokens truncation bug in the first place.
  */
 export interface DetailedBatchItemResult extends BatchItemResult {
+  core_pattern: CorePattern | null;
   sentence_structure: SentenceStructure | null;
   grammar_points: { pattern: string; meaning: string; example: string }[];
   vocabulary: VocabularyItem[];

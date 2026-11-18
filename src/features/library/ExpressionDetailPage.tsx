@@ -3,7 +3,7 @@ import { useNavigate, useParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { supabase } from '@/lib/supabase';
 import { useAuth } from '@/contexts/AuthContext';
-import { analyzeDetailed, type SentenceStructure, type VocabularyItem } from '@/features/ai-batch/aiBatchClient';
+import { analyzeDetailed, type SentenceStructure, type VocabularyItem, type CorePattern } from '@/features/ai-batch/aiBatchClient';
 import { applyAnalysisResult, markAnalyzing } from '@/features/ai-batch/applyAnalysisResult';
 import { effectiveAnalysisState } from '@/features/ai-batch/staleAnalysis';
 import { analyzeLemmaBatch } from '@/features/vocabulary/lemmaClient';
@@ -20,6 +20,7 @@ interface LemmaAnalysisData {
 }
 
 interface DetailedAnalysisData {
+  core_pattern?: CorePattern | null; // absent on legacy detailed-v1 cached rows
   sentence_structure: SentenceStructure | null;
   grammar_points: { pattern: string; meaning: string; example: string }[];
   vocabulary: VocabularyItem[];
@@ -248,6 +249,18 @@ export default function ExpressionDetailPage() {
 
       {analysis && (
         <>
+          {/* 핵심 패턴 (v2): 숙어/반조동사 구문(se mettre à + infinitif 등) 인식 -- 문장 구조보다 먼저 */}
+          {analysis.core_pattern && (
+            <section className="rounded-2xl border border-blue-200 p-4 dark:border-blue-800">
+              <h2 className="mb-2 text-sm font-bold">핵심 패턴</h2>
+              <p className="font-medium">
+                {analysis.core_pattern.pattern} <span className="text-sm text-slate-500">— {analysis.core_pattern.meaning_ko}</span>
+              </p>
+              <p className="mt-1 text-sm text-slate-500">문장 속 형태: {analysis.core_pattern.matched_form}</p>
+              <p className="mt-2 text-sm text-slate-600 dark:text-slate-300">{analysis.core_pattern.explanation_ko}</p>
+            </section>
+          )}
+
           {/* B. 문장 구조 */}
           {analysis.sentence_structure && (
             <section className="rounded-2xl border border-slate-200 p-4 dark:border-slate-800">
