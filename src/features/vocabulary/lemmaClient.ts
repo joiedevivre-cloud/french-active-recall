@@ -39,3 +39,22 @@ export async function analyzeLemmaBatch(expressionIds: string[], force = false):
     return { status: 'failed', error: err instanceof Error ? err.message : 'unknown_error' };
   }
 }
+
+export interface SeedDictionaryOutcome {
+  status: 'success' | 'failed';
+  senseCount?: number;
+  error?: string;
+}
+
+/** Generates a lemma's main dictionary senses up front (separate AI task from analyzeLemmaBatch's per-sentence classification). Never throws. */
+export async function seedLemmaDictionary(lemmaId: string): Promise<SeedDictionaryOutcome> {
+  try {
+    const { data, error } = await supabase.functions.invoke('analyze-lemma', { body: { action: 'seed_dictionary', lemmaId } });
+    if (error || !data?.ok) {
+      return { status: 'failed', error: data?.error ?? error?.message ?? 'invalid_response' };
+    }
+    return { status: 'success', senseCount: data.senseCount };
+  } catch (err) {
+    return { status: 'failed', error: err instanceof Error ? err.message : 'unknown_error' };
+  }
+}

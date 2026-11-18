@@ -3,7 +3,9 @@ import type { DbRating, ReviewStateRow } from '@/lib/fsrs';
 
 export interface ConfirmReviewGradeInput {
   reviewStateId: string;
-  expressionId: string;
+  /** Exactly one of expressionId / lemmaUsageId must be set (enforced by the RPC, migration 0016). */
+  expressionId?: string | null;
+  lemmaUsageId?: string | null;
   rating: DbRating;
   attemptType: string;
   mode?: string;
@@ -42,7 +44,8 @@ export async function confirmReviewGrade(
   const { data, error } = await supabase.rpc('confirm_review_grade', {
     p_client_id: clientId,
     p_review_state_id: input.reviewStateId,
-    p_expression_id: input.expressionId,
+    p_expression_id: input.expressionId ?? null,
+    p_lemma_usage_id: input.lemmaUsageId ?? null,
     p_rating: input.rating,
     p_attempt_type: input.attemptType,
     p_mode: input.mode ?? 'meaning_recall',

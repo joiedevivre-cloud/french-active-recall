@@ -11,8 +11,7 @@ import { analyzeLemmaBatch } from '@/features/vocabulary/lemmaClient';
 interface LemmaAnalysisData {
   lemma_id: string;
   usage_id: string;
-  pronunciation_ko: string | null;
-  pronunciation_liaison: string | null;
+  pronunciation_ipa: string | null;
   pronunciation_note: string | null;
   grammar_points: { form: string; meaning: string; example: string }[];
   lemmas: { lemma: string } | null;
@@ -91,7 +90,7 @@ export default function ExpressionDetailPage() {
     queryFn: async () => {
       const { data, error } = await supabase
         .from('expression_analysis')
-        .select('lemma_id, usage_id, pronunciation_ko, pronunciation_liaison, pronunciation_note, grammar_points, lemmas(lemma), lemma_usages(label)')
+        .select('lemma_id, usage_id, pronunciation_ipa, pronunciation_note, grammar_points, lemmas(lemma), lemma_usages(label)')
         .eq('expression_id', id!)
         .maybeSingle();
       if (error) throw error;
@@ -205,12 +204,7 @@ export default function ExpressionDetailPage() {
                 {runLemmaAnalysis.isPending ? '재생성 중...' : '다시 생성'}
               </button>
             </div>
-            {lemmaAnalysis.pronunciation_ko && (
-              <p className="text-sm text-slate-500">
-                {lemmaAnalysis.pronunciation_ko}
-                {lemmaAnalysis.pronunciation_liaison && ` · 연음: ${lemmaAnalysis.pronunciation_liaison}`}
-              </p>
-            )}
+            {lemmaAnalysis.pronunciation_ipa && <p className="text-sm text-slate-500">{lemmaAnalysis.pronunciation_ipa}</p>}
             {lemmaAnalysis.pronunciation_note && <p className="text-xs text-slate-400">{lemmaAnalysis.pronunciation_note}</p>}
             {lemmaAnalysis.grammar_points.length > 0 && (
               <details className="mt-1">

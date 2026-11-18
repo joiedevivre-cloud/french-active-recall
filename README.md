@@ -198,7 +198,7 @@ Vitest 양쪽에서 같은 파일 import, `lemmaMatching.ts`와 동일 패턴).
 ## 단어장 (lemma/쓰임 분류)
 
 표현장의 표현들을 핵심 단어(lemma, 예: "mettre") 기준으로 묶어서 쓰임별로
-보여주는 기능. 발음(IPA/한글/연음)과 문법 설명 1-3개도 같이 생성되어
+보여주는 기능. 발음(IPA)과 문법 설명 1-3개도 같이 생성되어
 **표현당 한 번만** 캐시된다(재호출은 `[다시 생성]`을 눌렀을 때만). 지난
 섹션의 상세 분석(`detailed_analysis`)과는 **완전히 별도 테이블**로
 존재하며 서로 덮어쓰지 않는다.
@@ -222,6 +222,40 @@ Vitest 양쪽에서 같은 파일 import, `lemmaMatching.ts`와 동일 패턴).
 **비용 참고**: 표현 1개 저장마다 light 분석 + 단어장 분석, 최소 AI 호출
 2번(상세 분석은 버튼을 눌러야만 발생하는 3번째 호출). 일일 한도
 (`ai_rate_limits.daily_expression_analyses`)로 과금은 제한되어 있음.
+
+### 다의어 누적 사전 + 쓰임별 FSRS (v2, `0016`)
+
+단어장을 "저장 문장 몇 개로 추정한 의미 1개"가 아니라 **lemma 하나의 여러
+의미/쓰임을 장기적으로 누적하는 사전**으로 확장.
+
+- **쓰임 재사용은 패턴이 정확히 같을 때만**: `resolveExistingUsageId`가
+  AI가 문장에서 인식한 `pattern`과 기존 usage의 `pattern`을 정규화(소문자/
+  악센트/공백) 후 비교해서 일치할 때만 재사용. 예전에는 id 소속만 확인해서
+  "Je me suis mise à chercher…"가 "mettre en marche(기기를 켜다)" usage로
+  잘못 들어가는 버그가 있었음. 불일치면 새 usage 생성 → 필요하면
+  `/vocabulary`에서 직접 합치기
+- **사전 의미 미리 생성** (`analyze-lemma`의 `action: 'seed_dictionary'`):
+  `/vocabulary`의 "사전 의미 보기" 버튼으로만 호출(자동 호출 없음). 주요
+  쓰임 5~10개를 `source='dictionary'`로 추가하며, 같은 패턴의 기존 usage가
+  있으면 **교체가 아니라 병합**(`findMergeTargetUsageId`)
+- **사용자 수정 보호 일반화**: `lemma_usages.user_edited_fields`에 들어간
+  필드는 재분석/병합 시 절대 덮어쓰지 않음(`label_user_edited`는 그대로 유지)
+- **쓰임별 FSRS**: `review_states`/`review_attempts`가 `expression_id` 또는
+  `lemma_usage_id` 중 정확히 하나를 가짐(새 SRS 테이블 없음). 실제 문장과
+  처음 연결된 usage는 자동으로 큐에 들어가고, 사전 의미는 "학습하기"
+  버튼으로 편입. `confirm_review_grade`에 `p_lemma_usage_id` 추가(기존
+  호출부 무변경)
+- 화면: 쓰임을 전체 / 학습한 / 아직 학습 안 함 / 복습 필요로 구분. AI가 만든
+  예문은 "AI 생성" 배지로 실제 저장 문장과 구분
+
+#### 한글 발음 음역 제거
+
+`pronunciation_ko`(단어/문장)는 더 이상 생성·표시하지 않음(컬럼은 과거
+데이터 보존용으로 남김). 대신 문장 전체 IPA(`expression_analysis.
+pronunciation_ipa`, 신규) + 단어 IPA + 🔊 실제 음성 재생만 사용.
+
+**기존 데이터**: 이미 잘못 분류된 문장은 코드 수정만으로 고쳐지지 않음 —
+`[다시 생성]` 또는 `npm run backfill:analysis -- --force`로 재분석 필요.
 
 ## 능동적 작문 훈련 + FSRS 장기 기억 시스템
 
@@ -310,6 +344,16 @@ Editor(또는 `supabase db push`)에서 직접 실행한다 — 자동으로 적
     (둘 다 `security invoker`). 기존 테이블 삭제/이름변경 없음, 전부
     nullable/default 컬럼 추가이거나 CHECK 제약을 상위집합으로 넓히는
     것뿐
+
+16. `0016_vocabulary_dictionary.sql` — **단어장 사전화**: `lemma_usages`에
+    `source`(dictionary/learned)/`meaning_ko`/`required_complement`/
+    `mood_requirement`/`grammar_explanation_ko`/`common_mistakes_ko`/
+    `ai_example_sentences`/`alternatives`/`user_edited_fields` 추가,
+    `expression_analysis.pronunciation_ipa` 추가, `review_states`/
+    `review_attempts`의 `expression_id`를 nullable로 바꾸고 `lemma_usage_id` +
+    "둘 중 정확히 하나" CHECK 추가, `confirm_review_grade` 재생성
+    (`p_lemma_usage_id` 추가, 이름 기반 호출이라 기존 호출부 무변경).
+    삭제/이름변경 없음
 
 ## Edge Function 배포
 

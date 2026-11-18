@@ -87,4 +87,38 @@ describe('confirmReviewGrade', () => {
       expect.objectContaining({ p_mode: 'meaning_recall', p_exercise_id: null, p_grammar_tags: [], p_ai_feedback: null })
     );
   });
+
+  it('passes p_lemma_usage_id (and a null p_expression_id) for a usage-level card', async () => {
+    rpcMock.mockResolvedValue({ data: [{ attempt_id: 'a2', already_applied: false }], error: null });
+
+    await confirmReviewGrade('client-456', {
+      reviewStateId: 'rs2',
+      lemmaUsageId: 'lu1',
+      rating: 'good',
+      attemptType: 'meaning_recall',
+      newReviewState: fakeNewState,
+    });
+
+    expect(rpcMock).toHaveBeenCalledWith(
+      'confirm_review_grade',
+      expect.objectContaining({ p_expression_id: null, p_lemma_usage_id: 'lu1' })
+    );
+  });
+
+  it('keeps existing expression-based callers unchanged (p_lemma_usage_id defaults to null)', async () => {
+    rpcMock.mockResolvedValue({ data: [{ attempt_id: 'a1', already_applied: false }], error: null });
+
+    await confirmReviewGrade('client-123', {
+      reviewStateId: 'rs1',
+      expressionId: 'e1',
+      rating: 'good',
+      attemptType: 'meaning_recall',
+      newReviewState: fakeNewState,
+    });
+
+    expect(rpcMock).toHaveBeenCalledWith(
+      'confirm_review_grade',
+      expect.objectContaining({ p_expression_id: 'e1', p_lemma_usage_id: null })
+    );
+  });
 });

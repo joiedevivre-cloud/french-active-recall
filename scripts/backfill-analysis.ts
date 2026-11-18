@@ -25,6 +25,7 @@ import {
   shouldCreateNewUsage,
   shouldPreserveUserAssignedUsage,
   shouldPreserveUserEditedLabel,
+  shouldPreserveField,
   shouldRetryAfterSchemaFailure,
 } from '../supabase/functions/_shared/lemmaMatching.ts';
 
@@ -122,7 +123,7 @@ async function analyzeOne(
   const { data: existingLemmaRows } = await admin.from('lemmas').select('id, lemma, part_of_speech').eq('user_id', expr.user_id);
   const { data: existingUsageRows } = await admin
     .from('lemma_usages')
-    .select('id, lemma_id, label, meaning_en, pattern')
+    .select('id, lemma_id, label, meaning_ko, pattern')
     .eq('user_id', expr.user_id);
   const existingLemmaContext: ExistingLemmaContext[] = (existingLemmaRows ?? []).map((l) => ({
     id: l.id,
@@ -130,7 +131,7 @@ async function analyzeOne(
     part_of_speech: l.part_of_speech,
     usages: (existingUsageRows ?? [])
       .filter((u) => u.lemma_id === l.id)
-      .map((u) => ({ id: u.id, label: u.label, meaning_en: u.meaning_en, pattern: u.pattern })),
+      .map((u) => ({ id: u.id, label: u.label, meaning_ko: u.meaning_ko, pattern: u.pattern })),
   }));
 
   let ai: AnalyzeAiResult | null = null;
@@ -154,8 +155,6 @@ async function analyzeOne(
         lemma: ai.lemma,
         part_of_speech: ai.part_of_speech,
         pronunciation_ipa: ai.pronunciation_ipa,
-        pronunciation_ko: ai.pronunciation_ko,
-        pronunciation_note: ai.pronunciation_note,
         grammar_notes: ai.grammar_notes,
       },
       { onConflict: 'user_id,lemma' }
@@ -172,9 +171,10 @@ async function analyzeOne(
     lemmaId = existingAnalysis.lemma_id;
     usageId = existingAnalysis.usage_id;
   } else {
-    const { data: usagesForLemma } = await admin.from('lemma_usages').select('id, label, label_user_edited').eq('lemma_id', lemmaId);
-    const resolvedId = resolveExistingUsageId(ai.usage.existing_usage_id, usagesForLemma ?? []);
+    const { data: usagesForLemma } = await admin.from('lemma_usages').select('id, label, pattern, label_user_edited, user_edited_fields').eq('lemma_id', lemmaId);
+    const resolvedId = resolveExistingUsageId(ai.usage.existing_usage_id, ai.usage.pattern, usagesForLemma ?? []);
 
+    let isNewUsageLink = false;
     if (shouldCreateNewUsage(resolvedId)) {
       const { count } = await admin.from('lemma_usages').select('id', { count: 'exact', head: true }).eq('lemma_id', lemmaId);
       const { data: newUsage, error: usageError } = await admin
@@ -184,8 +184,9 @@ async function analyzeOne(
             user_id: expr.user_id,
             lemma_id: lemmaId,
             label: ai.usage.label,
-            meaning_en: ai.usage.meaning_en,
+            meaning_ko: ai.usage.meaning_ko,
             pattern: ai.usage.pattern,
+            source: 'learned',
             sort_order: count ?? 0,
           },
           { onConflict: 'lemma_id,label' }
@@ -194,12 +195,21 @@ async function analyzeOne(
         .single();
       if (usageError || !newUsage) throw new Error(`usage_upsert_failed: ${usageError?.message}`);
       usageId = newUsage.id;
+      isNewUsageLink = true;
     } else {
       usageId = resolvedId!;
       const existingUsage = (usagesForLemma ?? []).find((u) => u.id === usageId) ?? null;
-      if (!shouldPreserveUserEditedLabel(existingUsage)) {
-        await admin.from('lemma_usages').update({ meaning_en: ai.usage.meaning_en, pattern: ai.usage.pattern }).eq('id', usageId);
-      }
+      const update: Record<string, unknown> = {};
+      if (!shouldPreserveUserEditedLabel(existingUsage)) update.label = ai.usage.label;
+      if (!shouldPreserveField(existingUsage?.user_edited_fields, 'meaning_ko')) update.meaning_ko = ai.usage.meaning_ko;
+      if (!shouldPreserveField(existingUsage?.user_edited_fields, 'pattern')) update.pattern = ai.usage.pattern;
+      if (Object.keys(update).length > 0) await admin.from('lemma_usages').update(update).eq('id', usageId);
+    }
+
+    const { data: existingUsageLink } = await admin.from('expression_analysis').select('expression_id').eq('usage_id', usageId).limit(1).maybeSingle();
+    if (!existingUsageLink) isNewUsageLink = true;
+    if (isNewUsageLink) {
+      await admin.from('review_states').upsert({ user_id: expr.user_id, lemma_usage_id: usageId }, { onConflict: 'user_id,lemma_usage_id', ignoreDuplicates: true });
     }
   }
 
@@ -210,8 +220,7 @@ async function analyzeOne(
       lemma_id: lemmaId,
       usage_id: usageId,
       usage_user_assigned: preserveAssignment,
-      pronunciation_ko: ai.sentence_pronunciation.pronunciation_ko,
-      pronunciation_liaison: ai.sentence_pronunciation.pronunciation_liaison,
+      pronunciation_ipa: ai.sentence_pronunciation.pronunciation_ipa,
       pronunciation_note: ai.sentence_pronunciation.pronunciation_note,
       grammar_points: ai.grammar_points,
       level: ai.level,
