@@ -2,6 +2,7 @@ import { supabase } from '@/lib/supabase';
 import { offlineDB, type PendingExpression } from '@/lib/db';
 import { normalizeFr } from '@/lib/normalizeFr';
 import { parsePasteText } from '@/lib/pasteParser';
+import { triggerAutoAnalysis } from '@/features/ai-batch/autoAnalyze';
 
 export interface AddExpressionInput {
   userId: string;
@@ -105,6 +106,7 @@ export async function addExpression(input: AddExpressionInput): Promise<AddExpre
   }
 
   let onlineCount = 0;
+  const needsAnalysis: { expressionId: string; expressionFr: string }[] = [];
   for (const row of rows) {
     const clientId = crypto.randomUUID();
     const { data, error } = await supabase
@@ -131,8 +133,12 @@ export async function addExpression(input: AddExpressionInput): Promise<AddExpre
 
     onlineCount++;
     await enqueueForReview(input.userId, data.id);
-    void supabase.functions.invoke('analyze-expression', { body: { expressionId: data.id } }).catch(() => {});
+    if (!row.meaningKo) needsAnalysis.push({ expressionId: data.id, expressionFr: row.expressionFr });
   }
+
+  // One batched call (via analyze-batch) instead of one Edge Function
+  // invocation per row -- same consolidation as the paste-save flow.
+  void triggerAutoAnalysis(needsAnalysis).catch(() => {});
 
   return {
     stored: onlineCount === rows.length ? 'online' : onlineCount === 0 ? 'offline' : 'online',
@@ -194,6 +200,7 @@ async function repairPendingExpression(row: PendingExpression): Promise<PendingE
  */
 export async function syncPendingExpressions(userId: string): Promise<void> {
   const pending = await offlineDB.pendingExpressions.where({ userId }).and((row) => row.syncStatus !== 'synced').toArray();
+  const needsAnalysis: { expressionId: string; expressionFr: string }[] = [];
 
   for (const original of pending) {
     let rowsToSync: PendingExpression[];
@@ -234,7 +241,7 @@ export async function syncPendingExpressions(userId: string): Promise<void> {
 
         await offlineDB.pendingExpressions.update(row.clientId, { syncStatus: 'synced', lastError: null });
         await enqueueForReview(row.userId, data.id);
-        void supabase.functions.invoke('analyze-expression', { body: { expressionId: data.id } }).catch(() => {});
+        if (!row.meaningKo) needsAnalysis.push({ expressionId: data.id, expressionFr: row.expressionFr });
       } catch (err) {
         await offlineDB.pendingExpressions.update(row.clientId, {
           syncStatus: 'error',
@@ -243,4 +250,6 @@ export async function syncPendingExpressions(userId: string): Promise<void> {
       }
     }
   }
+
+  void triggerAutoAnalysis(needsAnalysis).catch(() => {});
 }

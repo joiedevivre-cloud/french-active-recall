@@ -33,11 +33,19 @@ const MAX_CHUNK_SIZE = 20;
 // independent of whatever a user's ai_rate_limits row says, so a
 // misconfigured/very high row can never request an enormous completion.
 const TOKENS_PER_ITEM_ESTIMATE = 350;
+// The detailed (sentence_structure/grammar_points/vocabulary/
+// common_mistakes/similar_expressions/example_sentences) schema is far
+// bigger per item -- gated to exactly 1 sentence per request (see
+// MAX_DETAILED_SENTENCES below) specifically so this large per-item cost
+// never has to multiply across a chunk.
+const DETAILED_TOKENS_PER_ITEM_ESTIMATE = 1800;
 const OUTPUT_TOKEN_OVERHEAD = 200;
 const MAX_TOTAL_OUTPUT_TOKENS = 4000;
+const MAX_DETAILED_SENTENCES = 1;
 
-function computeMaxOutputTokens(sentenceCount: number, configuredCeiling: number): number {
-  const estimated = sentenceCount * TOKENS_PER_ITEM_ESTIMATE + OUTPUT_TOKEN_OVERHEAD;
+function computeMaxOutputTokens(sentenceCount: number, configuredCeiling: number, detailed: boolean): number {
+  const perItem = detailed ? DETAILED_TOKENS_PER_ITEM_ESTIMATE : TOKENS_PER_ITEM_ESTIMATE;
+  const estimated = sentenceCount * perItem + OUTPUT_TOKEN_OVERHEAD;
   return Math.min(estimated, MAX_TOTAL_OUTPUT_TOKENS, configuredCeiling);
 }
 
@@ -60,7 +68,39 @@ interface BatchItemResult {
   key_phrase: string;
 }
 
-const RESULT_ITEM_SCHEMA = {
+interface SentenceStructure {
+  main_clause: string;
+  conjunction: string;
+  subordinate_clause: string;
+  core_structure: string;
+  infinitive: string;
+  conjugated_form: string;
+  mood_explanation: string;
+  mood_contrast: string;
+  overall_meaning: string;
+}
+
+interface VocabularyItem {
+  word: string;
+  part_of_speech: string;
+  meaning_ko: string;
+  infinitive: string | null;
+  tense_or_conjugation: string | null;
+  gender_agreement: string | null;
+  preposition: string | null;
+  common_mistake: string | null;
+}
+
+interface DetailedBatchItemResult extends BatchItemResult {
+  sentence_structure: SentenceStructure | null;
+  grammar_points: { pattern: string; meaning: string; example: string }[];
+  vocabulary: VocabularyItem[];
+  common_mistakes: string[];
+  similar_expressions: { a: string; b: string; difference: string }[];
+  example_sentences: { fr: string; ko: string }[];
+}
+
+const LIGHT_RESULT_ITEM_SCHEMA = {
   type: 'object',
   properties: {
     expression_fr: { type: 'string' },
@@ -87,14 +127,108 @@ const RESULT_ITEM_SCHEMA = {
   additionalProperties: false,
 };
 
-const RESPONSE_SCHEMA = {
-  type: 'object',
+// Only used when detailed=true (see below) -- a SINGLE sentence at a time.
+// Deliberately NOT part of the light/bulk schema: every field here adds a
+// lot of Korean-heavy output, and this is exactly the kind of per-item
+// cost growth that caused the max_tokens truncation bug when it was
+// implicitly applied to a whole multi-sentence chunk. Keeping this gated
+// to one sentence per request means the token budget never has to scale
+// with chunk size for this schema at all.
+const SENTENCE_STRUCTURE_SCHEMA = {
+  type: ['object', 'null'],
   properties: {
-    results: { type: 'array', items: RESULT_ITEM_SCHEMA },
+    main_clause: { type: 'string' },
+    conjunction: { type: 'string' },
+    subordinate_clause: { type: 'string' },
+    core_structure: { type: 'string' },
+    infinitive: { type: 'string' },
+    conjugated_form: { type: 'string' },
+    mood_explanation: { type: 'string' },
+    mood_contrast: { type: 'string' },
+    overall_meaning: { type: 'string' },
   },
-  required: ['results'],
+  required: [
+    'main_clause',
+    'conjunction',
+    'subordinate_clause',
+    'core_structure',
+    'infinitive',
+    'conjugated_form',
+    'mood_explanation',
+    'mood_contrast',
+    'overall_meaning',
+  ],
   additionalProperties: false,
 };
+
+const VOCABULARY_ITEM_SCHEMA = {
+  type: 'object',
+  properties: {
+    word: { type: 'string' },
+    part_of_speech: { type: 'string' },
+    meaning_ko: { type: 'string' },
+    infinitive: { type: ['string', 'null'] },
+    tense_or_conjugation: { type: ['string', 'null'] },
+    gender_agreement: { type: ['string', 'null'] },
+    preposition: { type: ['string', 'null'] },
+    common_mistake: { type: ['string', 'null'] },
+  },
+  required: ['word', 'part_of_speech', 'meaning_ko', 'infinitive', 'tense_or_conjugation', 'gender_agreement', 'preposition', 'common_mistake'],
+  additionalProperties: false,
+};
+
+const GRAMMAR_POINT_SCHEMA = {
+  type: 'object',
+  properties: { pattern: { type: 'string' }, meaning: { type: 'string' }, example: { type: 'string' } },
+  required: ['pattern', 'meaning', 'example'],
+  additionalProperties: false,
+};
+
+const SIMILAR_EXPRESSION_SCHEMA = {
+  type: 'object',
+  properties: { a: { type: 'string' }, b: { type: 'string' }, difference: { type: 'string' } },
+  required: ['a', 'b', 'difference'],
+  additionalProperties: false,
+};
+
+const EXAMPLE_SENTENCE_SCHEMA = {
+  type: 'object',
+  properties: { fr: { type: 'string' }, ko: { type: 'string' } },
+  required: ['fr', 'ko'],
+  additionalProperties: false,
+};
+
+const DETAILED_RESULT_ITEM_SCHEMA = {
+  type: 'object',
+  properties: {
+    ...LIGHT_RESULT_ITEM_SCHEMA.properties,
+    sentence_structure: SENTENCE_STRUCTURE_SCHEMA,
+    grammar_points: { type: 'array', items: GRAMMAR_POINT_SCHEMA },
+    vocabulary: { type: 'array', items: VOCABULARY_ITEM_SCHEMA },
+    common_mistakes: { type: 'array', items: { type: 'string' } },
+    similar_expressions: { type: 'array', items: SIMILAR_EXPRESSION_SCHEMA },
+    example_sentences: { type: 'array', items: EXAMPLE_SENTENCE_SCHEMA },
+  },
+  required: [
+    ...LIGHT_RESULT_ITEM_SCHEMA.required,
+    'sentence_structure',
+    'grammar_points',
+    'vocabulary',
+    'common_mistakes',
+    'similar_expressions',
+    'example_sentences',
+  ],
+  additionalProperties: false,
+};
+
+function buildResponseSchema(itemSchema: unknown) {
+  return {
+    type: 'object',
+    properties: { results: { type: 'array', items: itemSchema } },
+    required: ['results'],
+    additionalProperties: false,
+  };
+}
 
 Deno.serve(async (req) => {
   if (req.method === 'OPTIONS') {
@@ -113,9 +247,11 @@ Deno.serve(async (req) => {
   const userId = userData.user.id;
 
   let sentences: string[] | undefined;
+  let detailed = false;
   try {
     const body = await req.json();
     sentences = body?.sentences;
+    detailed = body?.detailed === true;
   } catch {
     return jsonResponse({ error: 'invalid_json_body' }, 400);
   }
@@ -124,6 +260,12 @@ Deno.serve(async (req) => {
   }
   if (sentences.length > MAX_CHUNK_SIZE) {
     return jsonResponse({ error: 'chunk_too_large', max: MAX_CHUNK_SIZE }, 400);
+  }
+  // The detailed schema's per-item output is large enough that letting it
+  // apply to more than one sentence would risk the exact truncation bug
+  // this function was already hit by -- so it's a hard, not a soft, limit.
+  if (detailed && sentences.length > MAX_DETAILED_SENTENCES) {
+    return jsonResponse({ error: 'detailed_mode_single_sentence_only', max: MAX_DETAILED_SENTENCES }, 400);
   }
 
   const admin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
@@ -203,12 +345,12 @@ Deno.serve(async (req) => {
       return jsonResponse({ error: 'openai_key_not_configured' }, 500);
     }
 
-    let results: BatchItemResult[];
+    let results: (BatchItemResult | DetailedBatchItemResult)[];
     let inputTokens = 0;
     let outputTokens = 0;
     try {
-      const maxOutputTokens = computeMaxOutputTokens(sentences.length, limits.max_output_tokens);
-      const completion = await callOpenAI(sentences, model, maxOutputTokens);
+      const maxOutputTokens = computeMaxOutputTokens(sentences.length, limits.max_output_tokens, detailed);
+      const completion = await callOpenAI(sentences, model, maxOutputTokens, detailed);
       results = completion.results;
       inputTokens = completion.inputTokens;
       outputTokens = completion.outputTokens;
@@ -279,12 +421,7 @@ async function logUsage(
   return { id: data?.id };
 }
 
-async function callOpenAI(
-  sentences: string[],
-  model: string,
-  maxOutputTokens: number
-): Promise<{ results: BatchItemResult[]; inputTokens: number; outputTokens: number }> {
-  const systemPrompt = `You are a French teacher helping a Korean-speaking learner (studying in Montreal, A2~B2 level) who just pasted a batch of French sentences/expressions they encountered.
+const LIGHT_SYSTEM_PROMPT_HEADER = `You are a French teacher helping a Korean-speaking learner (studying in Montreal, A2~B2 level) who just pasted a batch of French sentences/expressions they encountered.
 
 For EACH input sentence, in the SAME ORDER, produce one result object with:
 - expression_fr: echo the original sentence back EXACTLY as given (this is used to match results back to inputs -- do not fix typos here).
@@ -295,9 +432,29 @@ For EACH input sentence, in the SAME ORDER, produce one result object with:
 - example_translation_ko: Korean translation of that example.
 - cefr_level: your best estimate, one of A1/A2/B1/B2/C1/C2.
 - tags: 1-3 short topic/grammar tags in Korean or French (e.g. "접속법", "일상 회화").
-- key_phrase: the single core phrase/pattern from this sentence most worth memorizing (e.g. "penser à", "il faut que + subjonctif").
+- key_phrase: the single core phrase/pattern from this sentence most worth memorizing (e.g. "penser à", "il faut que + subjonctif").`;
 
-Return exactly ${sentences.length} result objects, one per input sentence, in input order. Never invent sentences that weren't given.`;
+const DETAILED_SYSTEM_PROMPT_EXTRA = `
+You are also asked for a deeper B1~B2 breakdown of this ONE sentence, for all the fields above PLUS:
+- sentence_structure: if the sentence has a main clause + subordinate clause (e.g. "il faut que + subjonctif"), fill in main_clause, conjunction, subordinate_clause, core_structure, infinitive (the subordinate verb's infinitive, or "" if none), conjugated_form (the actual conjugated form used, or "" if none), mood_explanation (Korean: why this mood -- subjunctive/indicative/etc. -- is used here), mood_contrast (Korean: how the meaning would differ with the other mood, or "" if not applicable), overall_meaning (Korean: a natural reading of the whole sentence). If the input is just a word/short phrase with no clause structure, set sentence_structure to null -- do not force a breakdown that doesn't apply.
+- grammar_points: 1 to 3 objects {pattern, meaning, example}, most useful first -- the actual grammar patterns present (tense/mood, structures like "avoir beau + infinitif", pronouns, negation). meaning is a Korean explanation anchored in THIS sentence, not a generic textbook definition. example is a different French sentence using the same pattern.
+- vocabulary: 0 to 6 objects for words/short expressions genuinely worth explaining (skip articles and trivial words -- "모든 관사와 쉬운 단어를 기계적으로 설명하지 않기"). Each: {word, part_of_speech, meaning_ko, infinitive (verb's dictionary form, or null), tense_or_conjugation (or null), gender_agreement (or null), preposition (preposition this word pairs with, or null), common_mistake (a mistake Korean learners often make with this word, or null)}.
+- common_mistakes: 0 to 3 short Korean strings about mistakes Korean learners commonly make with THIS sentence/expression as a whole (separate from per-word ones already in vocabulary). Empty array if none stand out.
+- similar_expressions: 0 to 3 objects {a, b, difference} ONLY for expressions genuinely easy to confuse with something in this sentence (e.g. "penser à" / "penser de", "depuis" / "pendant"). difference is a short Korean explanation. Return an empty array rather than inventing a comparison that isn't real.
+- example_sentences: EXACTLY 2 objects {fr, ko} -- new natural French example sentences reusing this sentence's key expression/structure, set in everyday Quebec life, at B1 level. Do not invent facts about a specific person; keep them generic.`;
+
+async function callOpenAI(
+  sentences: string[],
+  model: string,
+  maxOutputTokens: number,
+  detailed: boolean
+): Promise<{ results: (BatchItemResult | DetailedBatchItemResult)[]; inputTokens: number; outputTokens: number }> {
+  const systemPrompt =
+    LIGHT_SYSTEM_PROMPT_HEADER +
+    (detailed ? DETAILED_SYSTEM_PROMPT_EXTRA : '') +
+    `\n\nReturn exactly ${sentences.length} result objects, one per input sentence, in input order. Never invent sentences that weren't given.`;
+
+  const schema = detailed ? DETAILED_RESULT_ITEM_SCHEMA : LIGHT_RESULT_ITEM_SCHEMA;
 
   const response = await fetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
@@ -310,7 +467,7 @@ Return exactly ${sentences.length} result objects, one per input sentence, in in
       max_tokens: maxOutputTokens,
       response_format: {
         type: 'json_schema',
-        json_schema: { name: 'batch_analysis', strict: true, schema: RESPONSE_SCHEMA },
+        json_schema: { name: 'batch_analysis', strict: true, schema: buildResponseSchema(schema) },
       },
       messages: [
         { role: 'system', content: systemPrompt },
@@ -345,9 +502,9 @@ Return exactly ${sentences.length} result objects, one per input sentence, in in
     throw new Error(`output_truncated: finish_reason=${choice.finish_reason}, length=${content.length}`);
   }
 
-  let parsed: { results: BatchItemResult[] };
+  let parsed: { results: (BatchItemResult | DetailedBatchItemResult)[] };
   try {
-    parsed = JSON.parse(content) as { results: BatchItemResult[] };
+    parsed = JSON.parse(content) as { results: (BatchItemResult | DetailedBatchItemResult)[] };
   } catch {
     // Belt-and-suspenders: even if finish_reason somehow read 'stop', a
     // response that still isn't valid JSON gets the same "try a smaller

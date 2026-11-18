@@ -142,7 +142,32 @@ Edge Function(`supabase/functions/analyze-batch`)은 `analyze-expression`과
 동일한 보안 체크(JWT 검증, Kill Switch, 동시요청 1개, 일일 한도/예산, OpenAI
 키는 서버 Secret에만)를 그대로 적용하고, 청크당 OpenAI 호출 1번으로 문장
 개수만큼 사용량을 차감한다. 응답 개수가 입력 개수와 다르면 그 청크 전체를
-실패로 처리한다(부분 매칭 추측 안 함).
+실패로 처리한다(부분 매칭 추측 안 함). 청크 크기는 6개(`CHUNK_SIZE`), 응답이
+`finish_reason:'length'`(토큰 한도로 중간에 끊김)면 `output_truncated`로
+명확히 실패 처리하고 **그 경우에만** 청크를 반으로 쪼개 최대 2단계까지
+재시도한다 (401/403/429 등은 재시도하지 않음).
+
+## 표현장 상세 화면 + AI 재분석
+
+표현장에서 표현을 **클릭**하면 `/expression/:id` 상세화면이 열린다 (즐겨찾기/
+수정/삭제 버튼은 별도 영역이라 클릭과 안 겹침):
+
+- 기본정보(원문/뜻/CEFR(AI 추정 명시)/🔊 발음(`speechSynthesis`, `fr-CA` 우선
+  → 없으면 `fr-FR`)/즐겨찾기/출처/마지막 분석 시간)
+- **[상세 분석 만들기]/[AI 다시 분석]** 버튼 → `analyze-batch`를 `detailed:
+  true`로 호출(문장 1개 한정, 서버가 강제). 성공하면 문장구조/핵심문법/
+  단어별 설명/흔한 실수/헷갈리는 표현/응용예문 2개가 `expressions.
+  detailed_analysis`(jsonb)에 저장되고, **다음부터는 저장된 값만 읽는다**
+  (화면 열 때마다 재호출 안 함)
+- 사용자가 직접 고친 `meaning_ko`는 `meaning_ko_user_edited` 플래그로
+  보호되어 재분석이 덮어쓰지 않음(다른 필드는 정상 갱신)
+
+**분석 상태 머신** (`src/features/ai-batch/staleAnalysis.ts`): `pending`(요청
+없음) / `analyzing`(진행중, `analysis_requested_at` 기록) / 90초 넘으면
+**`stalled`로 자동 전환**("응답 없음 — 다시 시도", 추측성 무한 로딩 표시 안 함) /
+`completed` / `failed`(실제 에러 메시지 표시, 재시도 가능). 표현장 상단
+[선택] 모드로 여러 표현 체크 후 [선택한 표현 AI 분석] / [미완료 전체 다시
+분석] / "실패한 표현만"·"뜻 없는 표현만" 빠른 선택 가능.
 
 ## 데이터베이스 마이그레이션
 
@@ -161,6 +186,8 @@ Editor(또는 `supabase db push`)에서 직접 실행한다 — 자동으로 적
 9. `0009_fix_client_id_conflict_targets.sql` — **중요 버그 수정**: `expressions`/`raw_notes`의 `client_id` 유니크 인덱스가 부분 인덱스(`WHERE client_id IS NOT NULL`)였는데, 앱의 모든 upsert는 조건 없는 `ON CONFLICT (user_id, client_id)`를 써서 Postgres가 매칭을 못 해 **모든 저장이 실패**하고 있었음. `client_id`를 NOT NULL로 만들고 일반 UNIQUE 제약으로 교체. 이 마이그레이션 전까지는 앱에서 저장한 어떤 표현도 실제로 Supabase에 반영되지 않았을 가능성이 높음
 10. `0010_ai_batch_fields.sql` — `expressions.corrected_fr`/`key_phrase` 추가, `ai_rate_limits.daily_expression_analyses` 기본값 30→150 (일괄 분석 최대 100개를 감당하기 위함, 기존 행도 갱신)
 11. `0011_cleanup_trailing_backslash.sql` — `/paste-save`로 저장된 기존 행 중 마크다운 줄바꿈 잔재(`\`)가 끝에 남은 `expression_fr`/`meaning_ko`를 정리 (해당 안 되는 행은 건드리지 않음, 삭제 없음)
+12. `0012_fix_max_output_tokens.sql` — **중요 버그 수정**: `ai_rate_limits.max_output_tokens` 기본값이 1024라서 15~20문장 배치 분석 시 OpenAI 응답이 중간에 끊겨 "Unterminated string in JSON" 오류가 났음. 기본값을 4000으로 올림(기존 행도 갱신) — `analyze-batch` 코드가 이 값을 상한으로 쓰는 동적 토큰 계산을 하므로, 이 마이그레이션 없이는 코드 수정도 무력화됨
+13. `0013_detailed_analysis.sql` — 표현 상세 화면용 구조화 분석 저장: `expressions.detailed_analysis`(jsonb)/`analyzed_at`/`analysis_version`/`analysis_requested_at`/`meaning_ko_user_edited` 추가, `ai_analysis_status`에 `'analyzing'` 상태 추가(요청없음=pending과 실제진행중=analyzing을 구분, 전부 추가적 변경이라 기존 데이터 영향 없음)
 
 ## Edge Function 배포
 
@@ -180,7 +207,7 @@ Switch)를 통과하기 전에는 실제 OpenAI 키를 연결하지 않는다.**
 
 ## 사용자가 직접 해야 하는 설정 (Claude Code가 대신 할 수 없는 작업)
 
-1. **Supabase 마이그레이션 적용**: 위 11개 SQL을 순서대로 SQL Editor에서 실행 (0011이 새로 추가됨, 아직 미실행이면 검토 후 적용)
+1. **Supabase 마이그레이션 적용**: 위 13개 SQL을 순서대로 SQL Editor에서 실행 (0012, 0013이 새로 추가됨, 아직 미실행이면 검토 후 적용)
 2. **Google OAuth**:
    - Google Cloud Console에서 OAuth 클라이언트 생성, 승인된 리디렉션 URI에
      `https://xwbcpanispdyrchddnzi.supabase.co/auth/v1/callback` 등록
@@ -203,7 +230,7 @@ Switch)를 통과하기 전에는 실제 OpenAI 키를 연결하지 않는다.**
 
 - `npm run typecheck` — 통과
 - `npm run build` — 통과 (더미 env로 로컬 빌드, 번들에 비밀키 누출 없음 확인)
-- `npm test` (`vitest`) — **69개 테스트 통과** (전부 모킹 기반, 실제 OpenAI/Supabase 네트워크 호출 없음)
+- `npm test` (`vitest`) — **88개 테스트 통과** (전부 모킹 기반, 실제 OpenAI/Supabase 네트워크 호출 없음)
   - `normalizeFr.test.ts` (3개)
   - `pasteParser.test.ts` (39개): 유저 예시 3줄 분리, 글머리 기호 9종,
     원형 숫자, 마크다운 굵게/코드/표, 구분자 8종, `peut-être`/`Qu'est-ce
@@ -216,16 +243,28 @@ Switch)를 통과하기 전에는 실제 OpenAI 키를 연결하지 않는다.**
   - `aiBatchClient.test.ts` (13개, `supabase.functions.invoke` 모킹): 청크 분할 경계값,
     성공/서버 에러/개수 불일치/네트워크 예외 각각의 실패 처리, 청크 하나가
     실패해도 나머지 청크는 계속 진행, 실패 청크만 모아내는 로직
-  - `applyAnalysisResult.test.ts` (9개, `supabase.from`/`functions.invoke` 모킹):
+  - `applyAnalysisResult.test.ts` (15개, `supabase.from`/`functions.invoke` 모킹):
     새 표현 분석 성공 시 DB 반영, 실패 시 `ai_analysis_status='failed'`만
     변경(원본 보존), 예문 신규삽입 vs 기존예문 업데이트(재분석 멱등성),
-    **실패 후 재시도가 정상 결과로 덮어쓰는지**, 배치 일부 실패, Edge
-    Function 네트워크 예외
+    실패 후 재시도가 정상 결과로 덮어쓰는지, 배치 일부 실패, Edge Function
+    네트워크 예외, **사용자가 수정한 `meaning_ko` 보호(다른 필드는 정상
+    갱신)**, **상세 분석(`detailed_analysis`/`analyzed_at`/
+    `analysis_version`) 저장**, `markAnalyzing` 상태 스탬프
+  - `staleAnalysis.test.ts` (7개): pending(요청없음)/analyzing(진행중)/
+    stalled(90초 넘게 응답없음)/completed/failed 상태 판정 경계값
+  - `aiBatchClient.test.ts` (19개, `supabase.functions.invoke` 모킹): 청크 분할 경계값,
+    성공/서버 에러/개수 불일치/네트워크 예외 각각의 실패 처리, 청크 하나가
+    실패해도 나머지 청크는 계속 진행, 실패 청크만 모아내는 로직,
+    **`output_truncated`만 반으로 쪼개 재시도(401/403/429는 재시도 안 함,
+    최대 깊이에서 포기)**, 실제 HTTP 상태/본문 추출 및 API 키 마스킹
 - `src/lib/csvImport.ts`용 자동 테스트는 **아직 작성 안 함** (CSV 미리보기 플로우는
   화면까지 만들지 않아 보류 — AI 일괄 분석은 별도의 `pasteParser` 기반 경로로 구현)
-- `analyze-batch`/`analyze-expression` Edge Function 자체(실제 OpenAI 응답 처리,
-  실제 AI 분석이 끝까지 성공하는지)는 **미검증** — 아래 "실제 Supabase/OpenAI
-  연동 검증" 참고
+- "표현 클릭 → 상세화면", "모바일 UI" 등 화면 동작은 **자동화 불가** (이
+  프로젝트에 컴포넌트 렌더링 테스트 도구가 없음) — 수동 확인 대상
+- `analyze-batch`/`analyze-expression` Edge Function의 실제 OpenAI 응답 처리는
+  **부분 검증됨** — 토큰 절단 수정(Phase 0)은 실제 로그로 성공 확인했으나,
+  이번에 추가한 **상세 분석(`detailed: true`) 경로는 아직 실제 호출로
+  검증 못함**. 아래 "실제 Supabase/OpenAI 연동 검증" 참고
 
 ### 수동 (사용자 환경에서만 가능 — 미검증)
 

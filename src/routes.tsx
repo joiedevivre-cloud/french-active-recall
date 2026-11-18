@@ -5,6 +5,7 @@ import LoginPage from '@/features/auth/LoginPage';
 import HomePage from '@/features/home/HomePage';
 import ClassMode from '@/features/class-mode/ClassMode';
 import LibraryPage from '@/features/library/LibraryPage';
+import ExpressionDetailPage from '@/features/library/ExpressionDetailPage';
 import PasteSavePage from '@/features/paste-save/PasteSavePage';
 import AiBatchAddPage from '@/features/ai-batch/AiBatchAddPage';
 import SyncStatusPage from '@/features/sync-status/SyncStatusPage';
@@ -25,6 +26,7 @@ export function AppRoutes() {
                 <Route path="/" element={<HomePage />} />
                 <Route path="/class-mode" element={<ClassMode />} />
                 <Route path="/library" element={<LibraryPage />} />
+                <Route path="/expression/:id" element={<ExpressionDetailPage />} />
                 <Route path="/paste-save" element={<PasteSavePage />} />
                 <Route path="/ai-batch" element={<AiBatchAddPage />} />
                 <Route path="/sync-status" element={<SyncStatusPage />} />

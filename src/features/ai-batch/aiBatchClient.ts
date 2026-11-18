@@ -21,6 +21,45 @@ export interface BatchItemResult {
   key_phrase: string;
 }
 
+export interface SentenceStructure {
+  main_clause: string;
+  conjunction: string;
+  subordinate_clause: string;
+  core_structure: string;
+  infinitive: string;
+  conjugated_form: string;
+  mood_explanation: string;
+  mood_contrast: string;
+  overall_meaning: string;
+}
+
+export interface VocabularyItem {
+  word: string;
+  part_of_speech: string;
+  meaning_ko: string;
+  infinitive: string | null;
+  tense_or_conjugation: string | null;
+  gender_agreement: string | null;
+  preposition: string | null;
+  common_mistake: string | null;
+}
+
+/**
+ * Only returned when a request sets `detailed: true` (exactly one
+ * sentence per request -- see analyzeDetailed). Deliberately NOT part of
+ * the bulk/auto-trigger path: this schema's per-item output is far larger,
+ * and applying it to a whole multi-sentence chunk is exactly the kind of
+ * cost growth that caused the max_tokens truncation bug in the first place.
+ */
+export interface DetailedBatchItemResult extends BatchItemResult {
+  sentence_structure: SentenceStructure | null;
+  grammar_points: { pattern: string; meaning: string; example: string }[];
+  vocabulary: VocabularyItem[];
+  common_mistakes: string[];
+  similar_expressions: { a: string; b: string; difference: string }[];
+  example_sentences: { fr: string; ko: string }[];
+}
+
 export interface AiBatchChunkResult {
   sentences: string[];
   status: 'success' | 'failed';
@@ -57,6 +96,37 @@ export async function analyzeChunk(sentences: string[]): Promise<AiBatchChunkRes
     return { sentences, status: 'success', results: data.results as BatchItemResult[] };
   } catch (err) {
     return { sentences, status: 'failed', error: err instanceof Error ? err.message : 'unknown_error' };
+  }
+}
+
+export interface DetailedAnalysisResult {
+  status: 'success' | 'failed';
+  result?: DetailedBatchItemResult;
+  error?: string;
+}
+
+/**
+ * The rich per-expression analysis (sentence structure, grammar points,
+ * vocabulary, confusable-expression comparisons, 2 fresh examples) used by
+ * the expression detail screen. Always exactly ONE sentence -- the server
+ * rejects more than that for `detailed: true` (see analyze-batch's
+ * MAX_DETAILED_SENTENCES), so this never needs chunking/retry-by-splitting
+ * the way the bulk path does.
+ */
+export async function analyzeDetailed(expressionFr: string): Promise<DetailedAnalysisResult> {
+  try {
+    const { data, error, response } = await supabase.functions.invoke('analyze-batch', {
+      body: { sentences: [expressionFr], detailed: true },
+    });
+    if (error) {
+      return { status: 'failed', error: await describeInvokeError(response) };
+    }
+    if (!data?.ok || !Array.isArray(data.results) || data.results.length !== 1) {
+      return { status: 'failed', error: data?.error ?? 'invalid_response' };
+    }
+    return { status: 'success', result: data.results[0] as DetailedBatchItemResult };
+  } catch (err) {
+    return { status: 'failed', error: err instanceof Error ? err.message : 'unknown_error' };
   }
 }
 

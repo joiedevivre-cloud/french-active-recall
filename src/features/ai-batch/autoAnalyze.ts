@@ -1,5 +1,5 @@
 import { analyzeSentencesInChunks, type BatchItemResult } from '@/features/ai-batch/aiBatchClient';
-import { applyAnalysisResult } from '@/features/ai-batch/applyAnalysisResult';
+import { applyAnalysisResult, markAnalyzing } from '@/features/ai-batch/applyAnalysisResult';
 
 export interface AnalyzableRow {
   expressionId: string;
@@ -12,12 +12,13 @@ export interface AnalyzableRow {
  * gave a meaning to -- re-analyzing it would be a wasted AI call for
  * something we already know). Uses the same batched Edge Function as
  * /ai-batch, so saving many expressions at once still costs one call per
- * ~15 of them, not one per expression.
+ * ~6 of them, not one per expression.
  */
 export async function triggerAutoAnalysis(rows: AnalyzableRow[]): Promise<void> {
   const toAnalyze = rows.filter((r) => r.expressionFr.trim().length > 0);
   if (toAnalyze.length === 0) return;
 
+  await markAnalyzing(toAnalyze.map((r) => r.expressionId));
   const chunkResults = await analyzeSentencesInChunks(toAnalyze.map((r) => r.expressionFr));
 
   const byText = new Map<string, BatchItemResult | null>();

@@ -1,32 +1,88 @@
 import { supabase } from '@/lib/supabase';
-import type { BatchItemResult } from '@/features/ai-batch/aiBatchClient';
+import type { BatchItemResult, DetailedBatchItemResult } from '@/features/ai-batch/aiBatchClient';
+
+export const DETAILED_ANALYSIS_VERSION = 'detailed-v1';
+
+function isDetailedResult(result: BatchItemResult | DetailedBatchItemResult): result is DetailedBatchItemResult {
+  return 'sentence_structure' in result;
+}
 
 /**
- * Writes one AI analysis result back onto its expression row (used by both
- * the auto-trigger-after-save path and a manual "재시도" in the library).
- * Passing `result: null` means the analysis failed -- this ONLY flips
- * ai_analysis_status to 'failed' and touches nothing else, so the original
- * expression_fr/meaning_ko the user saved is never lost or altered.
+ * Stamps every given expression as "a request is actually in flight right
+ * now", BEFORE calling analyze-batch. Without this, a row sits at
+ * 'pending' (or stays 'failed') while genuinely being retried, which is
+ * exactly what made a stuck request indistinguishable from one nobody had
+ * asked to analyze yet. See src/features/ai-batch/staleAnalysis.ts for how
+ * a request that never comes back gets detected later.
  */
-export async function applyAnalysisResult(expressionId: string, result: BatchItemResult | null): Promise<void> {
+export async function markAnalyzing(expressionIds: string[]): Promise<void> {
+  if (expressionIds.length === 0) return;
+  await supabase
+    .from('expressions')
+    .update({ ai_analysis_status: 'analyzing', analysis_requested_at: new Date().toISOString() })
+    .in('id', expressionIds);
+}
+
+/**
+ * Writes one AI analysis result back onto its expression row (used by the
+ * auto-trigger-after-save path, the library's individual/batch retry, and
+ * the detail screen's "AI 다시 분석"). Passing `result: null` means the
+ * analysis failed -- this ONLY flips ai_analysis_status to 'failed' and
+ * touches nothing else, so the original expression_fr/meaning_ko/detailed
+ * analysis the user already has is never lost or altered.
+ *
+ * If the user has manually edited meaning_ko (meaning_ko_user_edited），
+ * re-analysis NEVER overwrites it -- every other field still updates
+ * normally, since the user only asked to protect the meaning they typed,
+ * not to freeze the whole row.
+ */
+export async function applyAnalysisResult(
+  expressionId: string,
+  result: BatchItemResult | DetailedBatchItemResult | null
+): Promise<void> {
   if (!result) {
     await supabase.from('expressions').update({ ai_analysis_status: 'failed' }).eq('id', expressionId);
     return;
   }
 
-  await supabase
+  const { data: current } = await supabase
     .from('expressions')
-    .update({
-      meaning_ko: result.meaning_ko,
-      grammar_note: result.grammar_note,
-      cefr_level: result.cefr_level,
-      corrected_fr: result.corrected_fr,
-      key_phrase: result.key_phrase,
-      ai_analysis_status: 'completed',
-    })
-    .eq('id', expressionId);
+    .select('meaning_ko_user_edited')
+    .eq('id', expressionId)
+    .maybeSingle();
 
-  if (!result.example_fr) return;
+  const update: Record<string, unknown> = {
+    grammar_note: result.grammar_note,
+    cefr_level: result.cefr_level,
+    corrected_fr: result.corrected_fr,
+    key_phrase: result.key_phrase,
+    ai_analysis_status: 'completed',
+  };
+  if (!current?.meaning_ko_user_edited) {
+    update.meaning_ko = result.meaning_ko;
+  }
+
+  if (isDetailedResult(result)) {
+    update.detailed_analysis = {
+      sentence_structure: result.sentence_structure,
+      grammar_points: result.grammar_points,
+      vocabulary: result.vocabulary,
+      common_mistakes: result.common_mistakes,
+      similar_expressions: result.similar_expressions,
+      example_sentences: result.example_sentences,
+    };
+    update.analyzed_at = new Date().toISOString();
+    update.analysis_version = DETAILED_ANALYSIS_VERSION;
+  }
+
+  await supabase.from('expressions').update(update).eq('id', expressionId);
+
+  // expression_examples still gets ONE representative example (used by
+  // TodayReview's fill-in-the-blank card) regardless of detailed mode --
+  // detailed's example_sentences[0] doubles as that representative example.
+  const exampleFr = isDetailedResult(result) ? result.example_sentences[0]?.fr ?? result.example_fr : result.example_fr;
+  const exampleKo = isDetailedResult(result) ? result.example_sentences[0]?.ko ?? result.example_translation_ko : result.example_translation_ko;
+  if (!exampleFr) return;
 
   // No client-side idempotency key on expression_examples -- check-then-write
   // so re-running analysis for the same expression doesn't pile up examples.
@@ -38,15 +94,12 @@ export async function applyAnalysisResult(expressionId: string, result: BatchIte
     .maybeSingle();
 
   if (existing) {
-    await supabase
-      .from('expression_examples')
-      .update({ sentence_fr: result.example_fr, translation_ko: result.example_translation_ko })
-      .eq('id', existing.id);
+    await supabase.from('expression_examples').update({ sentence_fr: exampleFr, translation_ko: exampleKo }).eq('id', existing.id);
   } else {
     await supabase.from('expression_examples').insert({
       expression_id: expressionId,
-      sentence_fr: result.example_fr,
-      translation_ko: result.example_translation_ko,
+      sentence_fr: exampleFr,
+      translation_ko: exampleKo,
       is_user_created: false,
     });
   }
