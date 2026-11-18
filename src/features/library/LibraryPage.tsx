@@ -3,8 +3,24 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { supabase } from '@/lib/supabase';
 import { useAuth } from '@/contexts/AuthContext';
 import { allPendingExpressions, type PendingExpression } from '@/lib/db';
+import { analyzeChunk } from '@/features/ai-batch/aiBatchClient';
+import { applyAnalysisResult } from '@/features/ai-batch/applyAnalysisResult';
 
 type QuickFilter = 'all' | 'today' | 'week' | 'favorite';
+
+const SOURCE_TYPE_LABELS: Record<string, string> = {
+  manual: '직접입력',
+  school: '학교 수업',
+  tv5monde: 'TV5MONDE',
+  daily: '일상 대화',
+  news: '뉴스',
+  video: '영상',
+  ocr: '사진',
+  voice: '음성',
+  import: '가져오기',
+  import_anki: 'Anki',
+  b2_700: 'B2 700문장',
+};
 
 interface ExpressionRow {
   id: string;
@@ -48,6 +64,10 @@ export default function LibraryPage() {
   const { data: expressions = [], isLoading } = useQuery({
     queryKey: ['expressions', user?.id, quickFilter, search],
     enabled: !!user,
+    // Background AI analysis (triggered right after a save) finishes
+    // asynchronously -- poll while anything is still 'pending' so the
+    // result shows up without the user having to manually refresh.
+    refetchInterval: (query) => (query.state.data?.some((e) => e.ai_analysis_status === 'pending') ? 4000 : false),
     queryFn: async () => {
       let query = supabase
         .from('expressions')
@@ -94,6 +114,16 @@ export default function LibraryPage() {
       invalidate();
       setEditingId(null);
     },
+  });
+
+  const retryAnalysis = useMutation({
+    mutationFn: async (expr: ExpressionRow) => {
+      await supabase.from('expressions').update({ ai_analysis_status: 'pending' }).eq('id', expr.id);
+      invalidate();
+      const result = await analyzeChunk([expr.expression_fr]);
+      await applyAnalysisResult(expr.id, result.status === 'success' ? result.results?.[0] ?? null : null);
+    },
+    onSettled: invalidate,
   });
 
   const filters: { key: QuickFilter; label: string }[] = useMemo(
@@ -177,14 +207,27 @@ export default function LibraryPage() {
                       저장
                     </button>
                   </div>
+                ) : expr.meaning_ko ? (
+                  <p className="mt-0.5 text-sm text-slate-500">{expr.meaning_ko}</p>
+                ) : expr.ai_analysis_status === 'failed' ? (
+                  <p className="mt-0.5 flex items-center gap-2 text-sm text-red-500">
+                    분석 실패
+                    <button
+                      onClick={() => retryAnalysis.mutate(expr)}
+                      disabled={retryAnalysis.isPending}
+                      className="rounded-full border border-red-400 px-2 py-0.5 text-xs disabled:opacity-40"
+                    >
+                      재시도
+                    </button>
+                  </p>
                 ) : (
-                  <p className="mt-0.5 text-sm text-slate-500">
-                    {expr.meaning_ko ?? (expr.ai_analysis_status === 'pending' ? 'AI 분석 중...' : '의미 없음')}
+                  <p className="mt-0.5 text-sm text-slate-400">AI 분석 중...</p>
+                )}
+                {(expr.cefr_level || SOURCE_TYPE_LABELS[expr.source_type]) && (
+                  <p className="mt-1 text-xs text-slate-400">
+                    {[expr.cefr_level, SOURCE_TYPE_LABELS[expr.source_type] ?? expr.source_type].filter(Boolean).join(' · ')}
                   </p>
                 )}
-                <p className="mt-1 text-xs text-slate-400">
-                  {expr.cefr_level ?? '-'} · {expr.source_type}
-                </p>
               </div>
               <div className="flex flex-col items-end gap-2 text-sm">
                 <button onClick={() => toggleFavorite.mutate({ id: expr.id, next: !expr.is_favorite })}>

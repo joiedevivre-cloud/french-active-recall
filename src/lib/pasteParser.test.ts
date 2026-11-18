@@ -161,6 +161,24 @@ ${USER_EXAMPLE}
   });
 });
 
+describe('parsePasteText - trailing markdown line-break backslash', () => {
+  it('strips a trailing backslash with no separator', () => {
+    const [row] = newRows(parsePasteText('Il me semble que cette solution est plus simple.\\'));
+    expect(row.expressionFr).toBe('Il me semble que cette solution est plus simple.');
+  });
+
+  it('strips a trailing backslash after a split', () => {
+    const [row] = newRows(parsePasteText("J'ai beau étudier, je fais encore des erreurs. — 아무리 공부해도 여전히 실수를 해. \\"));
+    expect(row.expressionFr).toBe("J'ai beau étudier, je fais encore des erreurs.");
+    expect(row.meaningKo).toBe('아무리 공부해도 여전히 실수를 해.');
+  });
+
+  it('does not touch real hyphens/apostrophes while stripping the backslash', () => {
+    const [row] = newRows(parsePasteText("Peut-être qu'il viendra. — 아마 그가 올 거야.\\"));
+    expect(row.expressionFr).toBe("Peut-être qu'il viendra.");
+  });
+});
+
 describe('parsePasteText - blank lines are ignored', () => {
   it('skips blank lines without producing rows or errors', () => {
     const result = parsePasteText('confier — 맡기다\n\n\nse confier — 속마음을 털어놓다\n');

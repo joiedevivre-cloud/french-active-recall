@@ -92,6 +92,17 @@ function isMarkdownTableDividerRow(line: string): boolean {
   return line.includes('-') && /^[\s|:-]+$/.test(line);
 }
 
+// Markdown's "hard line break" convention is a line ending in one or more
+// backslashes (or two-plus trailing spaces, handled by the trim elsewhere).
+// Many chat/export tools emit this even for plain text, so a pasted
+// sentence like "...simple.\" picks up a backslash that was never part of
+// the French. French orthography has no legitimate use for a trailing
+// backslash, so stripping it is always safe -- unlike a mid-word hyphen or
+// apostrophe, which this function never touches.
+function stripTrailingLineBreakBackslash(text: string): string {
+  return text.replace(/\\+\s*$/, '').trimEnd();
+}
+
 function isCurlyDoubleQuote(char: string, codePoint: number): boolean {
   return codePoint === CURLY_DOUBLE_LEFT || codePoint === CURLY_DOUBLE_RIGHT || char === '"';
 }
@@ -145,7 +156,8 @@ export function parsePasteText(raw: string): PasteParseResult {
 
     const withoutBullet = stripLeadingDecoration(trimmedRaw);
     const withoutEmphasis = stripMarkdownEmphasis(withoutBullet);
-    const cleaned = stripMarkdownTablePipes(withoutEmphasis).trim();
+    const withoutTablePipes = stripMarkdownTablePipes(withoutEmphasis);
+    const cleaned = stripTrailingLineBreakBackslash(withoutTablePipes).trim();
     if (!cleaned) return;
     if (isMarkdownTableDividerRow(cleaned)) return;
 

@@ -1,6 +1,7 @@
 import { supabase } from '@/lib/supabase';
 import { offlineDB, type PendingPasteBatch, type PendingPasteRow } from '@/lib/db';
 import { enqueueForReview } from '@/features/capture/addExpression';
+import { triggerAutoAnalysis } from '@/features/ai-batch/autoAnalyze';
 import type { SourceType } from '@/lib/csvImport';
 
 /**
@@ -170,6 +171,16 @@ async function syncOnePasteBatch(batch: PendingPasteBatch): Promise<SavedRowResu
   }
 
   await offlineDB.pendingPasteBatches.update(batch.batchClientId, { syncStatus: 'synced', lastError: null });
+
+  // Only expressions the user didn't already give a meaning to need AI --
+  // one that came with "fr — ko" already filled in (or from /ai-batch,
+  // which analyzes before saving) is skipped, so a duplicate paste never
+  // re-spends an AI call on something already known.
+  const needsAnalysis = saved.filter((_row, i) => !batch.rows[i].meaningKo);
+  void triggerAutoAnalysis(needsAnalysis.map((row) => ({ expressionId: row.expressionId, expressionFr: row.expressionFr }))).catch(
+    () => {}
+  );
+
   return saved;
 }
 

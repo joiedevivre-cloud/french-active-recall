@@ -100,13 +100,18 @@ HashRouter 대신 이 방식을 선택한 이유: Supabase Google OAuth는 PKCE
   `pendingPasteBatches`(IndexedDB)에 배치 전체를 저장했다가 온라인 복귀
   시 통째로 동기화한다(원문 → 표현 순서 보장, `client_id` 기반 멱등).
 - 저장되는 `meaning_ko`/`expression_fr`은 사용자가 붙여넣은 그대로이며
-  AI가 생성한 값이 아니다 (`ai_analysis_status`는 `pending`으로 남아
-  있어 이후 분석과 구분됨).
+  AI가 생성한 값이 아니다.
+- **저장 직후 `meaning_ko`가 빈 표현만 자동으로 AI 분석된다**
+  (`src/features/ai-batch/autoAnalyze.ts`가 `analyze-batch`를 호출, 여러
+  개를 저장해도 15개씩 묶어서 한 번에 호출 — 이미 뜻이 있는 표현이나
+  중복으로 걸러진 표현은 다시 호출하지 않는다). 성공하면 `meaning_ko`/
+  `grammar_note`/`cefr_level`/`corrected_fr`/`key_phrase`/예문이 채워지고
+  `ai_analysis_status`가 `completed`로, 실패하면 `failed`로 바뀐다
+  (`pending`으로 영원히 남지 않음). 표현장에서 실패 항목은 "분석 실패 —
+  재시도" 버튼으로 다시 시도할 수 있다.
 
-**아직 구현하지 않은 보조 기능** (요청에서 "위 기능이 완성된 뒤"로 명시된 부분):
+**아직 구현하지 않은 보조 기능**:
 - "확인 필요" 줄을 Edge Function으로 AI 정리하는 `[AI로 정리]` 버튼
-- `meaning_ko`가 빈 표현을 백그라운드 AI로 채우는 자동화 (현재는 수동으로
-  표현장에서 수정하거나, 추후 이 자동화가 추가될 때까지 비어 있는 채로 둠)
 
 **별개로 주의할 점:** `src/content/chatgpt-prompt.md`에 넣은 ChatGPT
 프롬프트는 **CSV 표 형식**(````csv` 블록, `프랑스어,한국어 뜻,분류,출처`
@@ -155,6 +160,7 @@ Editor(또는 `supabase db push`)에서 직접 실행한다 — 자동으로 적
 8. `0008_raw_notes.sql` — `raw_notes`(붙여넣은 원문 보존) + `expressions.raw_note_id`
 9. `0009_fix_client_id_conflict_targets.sql` — **중요 버그 수정**: `expressions`/`raw_notes`의 `client_id` 유니크 인덱스가 부분 인덱스(`WHERE client_id IS NOT NULL`)였는데, 앱의 모든 upsert는 조건 없는 `ON CONFLICT (user_id, client_id)`를 써서 Postgres가 매칭을 못 해 **모든 저장이 실패**하고 있었음. `client_id`를 NOT NULL로 만들고 일반 UNIQUE 제약으로 교체. 이 마이그레이션 전까지는 앱에서 저장한 어떤 표현도 실제로 Supabase에 반영되지 않았을 가능성이 높음
 10. `0010_ai_batch_fields.sql` — `expressions.corrected_fr`/`key_phrase` 추가, `ai_rate_limits.daily_expression_analyses` 기본값 30→150 (일괄 분석 최대 100개를 감당하기 위함, 기존 행도 갱신)
+11. `0011_cleanup_trailing_backslash.sql` — `/paste-save`로 저장된 기존 행 중 마크다운 줄바꿈 잔재(`\`)가 끝에 남은 `expression_fr`/`meaning_ko`를 정리 (해당 안 되는 행은 건드리지 않음, 삭제 없음)
 
 ## Edge Function 배포
 
@@ -174,7 +180,7 @@ Switch)를 통과하기 전에는 실제 OpenAI 키를 연결하지 않는다.**
 
 ## 사용자가 직접 해야 하는 설정 (Claude Code가 대신 할 수 없는 작업)
 
-1. **Supabase 마이그레이션 적용**: 위 10개 SQL을 순서대로 SQL Editor에서 실행 (0010이 새로 추가됨, 아직 미실행이면 검토 후 적용)
+1. **Supabase 마이그레이션 적용**: 위 11개 SQL을 순서대로 SQL Editor에서 실행 (0011이 새로 추가됨, 아직 미실행이면 검토 후 적용)
 2. **Google OAuth**:
    - Google Cloud Console에서 OAuth 클라이언트 생성, 승인된 리디렉션 URI에
      `https://xwbcpanispdyrchddnzi.supabase.co/auth/v1/callback` 등록
@@ -197,21 +203,29 @@ Switch)를 통과하기 전에는 실제 OpenAI 키를 연결하지 않는다.**
 
 - `npm run typecheck` — 통과
 - `npm run build` — 통과 (더미 env로 로컬 빌드, 번들에 비밀키 누출 없음 확인)
-- `npm test` (`vitest`) — **57개 테스트 통과**
+- `npm test` (`vitest`) — **69개 테스트 통과** (전부 모킹 기반, 실제 OpenAI/Supabase 네트워크 호출 없음)
   - `normalizeFr.test.ts` (3개)
-  - `pasteParser.test.ts` (36개): 유저 예시 3줄 분리, 글머리 기호 9종,
+  - `pasteParser.test.ts` (39개): 유저 예시 3줄 분리, 글머리 기호 9종,
     원형 숫자, 마크다운 굵게/코드/표, 구분자 8종, `peut-être`/`Qu'est-ce
     que`/`Est-ce que` 보존, 프랑스어만 있는 줄, 제목→tags, 한글만 있는
-    줄→확인 필요, 설명 문장 무시, 빈 줄 무시, 중복(정확 일치/악센트
-    다름/아포스트로피 통일/배치 내 반복/재붙여넣기) 전부 포함
+    줄→확인 필요, 설명 문장 무시, 빈 줄 무시, **줄 끝 마크다운 역슬래시
+    제거(3개, 분리 전/후 모두 포함, 하이픈·아포스트로피 안 건드리는지
+    확인)**, 중복(정확 일치/악센트 다름/아포스트로피 통일/배치 내 반복/
+    재붙여넣기) 전부 포함
   - `addExpression.test.ts` (5개): [+ 표현 추가] 입력이 fr/ko로 분리되는지, 출처 키워드→school 매핑
   - `aiBatchClient.test.ts` (13개, `supabase.functions.invoke` 모킹): 청크 분할 경계값,
     성공/서버 에러/개수 불일치/네트워크 예외 각각의 실패 처리, 청크 하나가
     실패해도 나머지 청크는 계속 진행, 실패 청크만 모아내는 로직
+  - `applyAnalysisResult.test.ts` (9개, `supabase.from`/`functions.invoke` 모킹):
+    새 표현 분석 성공 시 DB 반영, 실패 시 `ai_analysis_status='failed'`만
+    변경(원본 보존), 예문 신규삽입 vs 기존예문 업데이트(재분석 멱등성),
+    **실패 후 재시도가 정상 결과로 덮어쓰는지**, 배치 일부 실패, Edge
+    Function 네트워크 예외
 - `src/lib/csvImport.ts`용 자동 테스트는 **아직 작성 안 함** (CSV 미리보기 플로우는
   화면까지 만들지 않아 보류 — AI 일괄 분석은 별도의 `pasteParser` 기반 경로로 구현)
-- `analyze-batch`/`analyze-expression` Edge Function 자체(실제 OpenAI 응답 처리)는
-  실키를 연결하지 않아 **미검증**
+- `analyze-batch`/`analyze-expression` Edge Function 자체(실제 OpenAI 응답 처리,
+  실제 AI 분석이 끝까지 성공하는지)는 **미검증** — 아래 "실제 Supabase/OpenAI
+  연동 검증" 참고
 
 ### 수동 (사용자 환경에서만 가능 — 미검증)
 
