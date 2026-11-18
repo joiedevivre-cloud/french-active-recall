@@ -6,6 +6,18 @@ import { useAuth } from '@/contexts/AuthContext';
 import { analyzeDetailed, type SentenceStructure, type VocabularyItem } from '@/features/ai-batch/aiBatchClient';
 import { applyAnalysisResult, markAnalyzing } from '@/features/ai-batch/applyAnalysisResult';
 import { effectiveAnalysisState } from '@/features/ai-batch/staleAnalysis';
+import { analyzeLemmaBatch } from '@/features/vocabulary/lemmaClient';
+
+interface LemmaAnalysisData {
+  lemma_id: string;
+  usage_id: string;
+  pronunciation_ko: string | null;
+  pronunciation_liaison: string | null;
+  pronunciation_note: string | null;
+  grammar_points: { form: string; meaning: string; example: string }[];
+  lemmas: { lemma: string } | null;
+  lemma_usages: { label: string } | null;
+}
 
 interface DetailedAnalysisData {
   sentence_structure: SentenceStructure | null;
@@ -72,7 +84,32 @@ export default function ExpressionDetailPage() {
     return { aiAnalysisStatus: e.ai_analysis_status, analysisRequestedAt: e.analysis_requested_at, meaningKo: e.meaning_ko };
   }
 
-  const invalidate = () => queryClient.invalidateQueries({ queryKey: ['expression-detail', id] });
+  const { data: lemmaAnalysis, isLoading: lemmaLoading } = useQuery({
+    queryKey: ['expression-lemma-analysis', id],
+    enabled: !!user && !!id,
+    queryFn: async () => {
+      const { data, error } = await supabase
+        .from('expression_analysis')
+        .select('lemma_id, usage_id, pronunciation_ko, pronunciation_liaison, pronunciation_note, grammar_points, lemmas(lemma), lemma_usages(label)')
+        .eq('expression_id', id!)
+        .maybeSingle();
+      if (error) throw error;
+      return data as unknown as LemmaAnalysisData | null;
+    },
+  });
+
+  const invalidate = () => {
+    queryClient.invalidateQueries({ queryKey: ['expression-detail', id] });
+    queryClient.invalidateQueries({ queryKey: ['expression-lemma-analysis', id] });
+  };
+
+  const runLemmaAnalysis = useMutation({
+    mutationFn: async (force: boolean) => {
+      if (!expr) return;
+      await analyzeLemmaBatch([expr.id], force);
+    },
+    onSettled: invalidate,
+  });
 
   const toggleFavorite = useMutation({
     mutationFn: async () => {
@@ -137,6 +174,60 @@ export default function ExpressionDetailPage() {
       <p className="text-xs text-slate-400">
         출처: {expr.source_label ?? expr.source_type} · 마지막 AI 분석: {expr.analyzed_at ? new Date(expr.analyzed_at).toLocaleString('ko-KR') : '없음'}
       </p>
+
+      {/* 단어장: 발음 + 쓰임 + 문법 설명 (detailed_analysis와는 완전히 별도 테이블/캐시) */}
+      <section className="rounded-2xl border border-slate-200 p-4 dark:border-slate-800">
+        {lemmaLoading && <p className="text-sm text-slate-400">단어 분석 불러오는 중...</p>}
+        {!lemmaLoading && !lemmaAnalysis && (
+          <button
+            onClick={() => runLemmaAnalysis.mutate(false)}
+            disabled={runLemmaAnalysis.isPending}
+            className="w-full rounded-full border border-slate-300 py-2 text-sm disabled:opacity-40 dark:border-slate-700"
+          >
+            {runLemmaAnalysis.isPending ? '분석 중...' : '단어 분석 만들기'}
+          </button>
+        )}
+        {lemmaAnalysis && (
+          <div className="flex flex-col gap-2">
+            <div className="flex items-center justify-between">
+              <button
+                onClick={() => navigate(`/vocabulary?lemma=${lemmaAnalysis.lemma_id}`)}
+                className="rounded-full bg-slate-100 px-3 py-1 text-sm dark:bg-slate-800"
+              >
+                쓰임: {lemmaAnalysis.lemmas?.lemma} – {lemmaAnalysis.lemma_usages?.label}
+              </button>
+              <button
+                onClick={() => runLemmaAnalysis.mutate(true)}
+                disabled={runLemmaAnalysis.isPending}
+                className="text-xs text-slate-400 disabled:opacity-40"
+              >
+                {runLemmaAnalysis.isPending ? '재생성 중...' : '다시 생성'}
+              </button>
+            </div>
+            {lemmaAnalysis.pronunciation_ko && (
+              <p className="text-sm text-slate-500">
+                {lemmaAnalysis.pronunciation_ko}
+                {lemmaAnalysis.pronunciation_liaison && ` · 연음: ${lemmaAnalysis.pronunciation_liaison}`}
+              </p>
+            )}
+            {lemmaAnalysis.pronunciation_note && <p className="text-xs text-slate-400">{lemmaAnalysis.pronunciation_note}</p>}
+            {lemmaAnalysis.grammar_points.length > 0 && (
+              <details className="mt-1">
+                <summary className="cursor-pointer text-sm font-medium">문법 설명 ▾</summary>
+                <ul className="mt-2 flex flex-col gap-2">
+                  {lemmaAnalysis.grammar_points.map((gp, i) => (
+                    <li key={i} className="text-sm">
+                      <p className="font-medium">{gp.form}</p>
+                      <p className="text-slate-500">{gp.meaning}</p>
+                      <p className="italic text-slate-400">{gp.example}</p>
+                    </li>
+                  ))}
+                </ul>
+              </details>
+            )}
+          </div>
+        )}
+      </section>
 
       {/* AI 다시 분석 */}
       <div>

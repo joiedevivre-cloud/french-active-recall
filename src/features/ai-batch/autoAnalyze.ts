@@ -1,5 +1,6 @@
 import { analyzeSentencesInChunks, type BatchItemResult } from '@/features/ai-batch/aiBatchClient';
 import { applyAnalysisResult, markAnalyzing } from '@/features/ai-batch/applyAnalysisResult';
+import { analyzeLemmaBatch } from '@/features/vocabulary/lemmaClient';
 
 export interface AnalyzableRow {
   expressionId: string;
@@ -29,4 +30,11 @@ export async function triggerAutoAnalysis(rows: AnalyzableRow[]): Promise<void> 
   }
 
   await Promise.all(toAnalyze.map((row) => applyAnalysisResult(row.expressionId, byText.get(row.expressionFr) ?? null)));
+
+  // Lemma/usage analysis (단어장) runs independently of the light analysis
+  // above -- a separate feature, separate tables, separate cache. Fired
+  // after the light pass but never allowed to block or fail it; swallow
+  // errors here the same way the light call's own failures are already
+  // handled per-row.
+  void analyzeLemmaBatch(toAnalyze.map((r) => r.expressionId)).catch(() => {});
 }

@@ -169,6 +169,34 @@ Edge Function(`supabase/functions/analyze-batch`)은 `analyze-expression`과
 [선택] 모드로 여러 표현 체크 후 [선택한 표현 AI 분석] / [미완료 전체 다시
 분석] / "실패한 표현만"·"뜻 없는 표현만" 빠른 선택 가능.
 
+## 단어장 (lemma/쓰임 분류)
+
+표현장의 표현들을 핵심 단어(lemma, 예: "mettre") 기준으로 묶어서 쓰임별로
+보여주는 기능. 발음(IPA/한글/연음)과 문법 설명 1-3개도 같이 생성되어
+**표현당 한 번만** 캐시된다(재호출은 `[다시 생성]`을 눌렀을 때만). 지난
+섹션의 상세 분석(`detailed_analysis`)과는 **완전히 별도 테이블**로
+존재하며 서로 덮어쓰지 않는다.
+
+- 새 테이블: `lemmas`(단어/발음/문법노트) / `lemma_usages`(단어별 쓰임,
+  `label_user_edited`로 사용자 수정 보호) / `expression_analysis`(표현 1개당
+  1행, `usage_user_assigned`로 사용자가 직접 옮긴 쓰임 보호)
+- 표현 저장 시 `triggerAutoAnalysis`에서 기존 light 분석과 **별도로,
+  추가로** 호출됨(`src/features/vocabulary/lemmaClient.ts` →
+  `analyze-lemma` Edge Function). 실패해도 light 분석에는 영향 없음
+- 표현 상세화면(`/expression/:id`)에 발음/쓰임 태그(누르면
+  `/vocabulary?lemma=...`)/문법 설명 접기 섹션 추가
+- 신규 화면 `/vocabulary` ("단어별 보기", 표현장 상단에 진입 버튼): 단어
+  검색+문장 수 → 선택 시 발음/품사/활용/헷갈리는 점 + 쓰임별로 묶인 문장
+  목록. 쓰임 라벨 인라인 수정, 문장을 다른 쓰임으로 드롭다운 이동 가능
+- 백필 스크립트 `scripts/backfill-analysis.ts` (`npm run backfill:analysis
+  -- --dry-run`): Edge Function은 사용자 JWT가 필요해 오프라인 스크립트에서
+  못 쓰므로, service role key로 OpenAI/DB에 직접 접근. 동시 3개 제한,
+  이미 분석된 건 건너뜀(`--force`로 강제), Kill Switch 확인 후 진행
+
+**비용 참고**: 표현 1개 저장마다 light 분석 + 단어장 분석, 최소 AI 호출
+2번(상세 분석은 버튼을 눌러야만 발생하는 3번째 호출). 일일 한도
+(`ai_rate_limits.daily_expression_analyses`)로 과금은 제한되어 있음.
+
 ## 데이터베이스 마이그레이션
 
 `supabase/migrations/`에 번호 순서로 들어있다. **검토 후 Supabase SQL
@@ -188,6 +216,7 @@ Editor(또는 `supabase db push`)에서 직접 실행한다 — 자동으로 적
 11. `0011_cleanup_trailing_backslash.sql` — `/paste-save`로 저장된 기존 행 중 마크다운 줄바꿈 잔재(`\`)가 끝에 남은 `expression_fr`/`meaning_ko`를 정리 (해당 안 되는 행은 건드리지 않음, 삭제 없음)
 12. `0012_fix_max_output_tokens.sql` — **중요 버그 수정**: `ai_rate_limits.max_output_tokens` 기본값이 1024라서 15~20문장 배치 분석 시 OpenAI 응답이 중간에 끊겨 "Unterminated string in JSON" 오류가 났음. 기본값을 4000으로 올림(기존 행도 갱신) — `analyze-batch` 코드가 이 값을 상한으로 쓰는 동적 토큰 계산을 하므로, 이 마이그레이션 없이는 코드 수정도 무력화됨
 13. `0013_detailed_analysis.sql` — 표현 상세 화면용 구조화 분석 저장: `expressions.detailed_analysis`(jsonb)/`analyzed_at`/`analysis_version`/`analysis_requested_at`/`meaning_ko_user_edited` 추가, `ai_analysis_status`에 `'analyzing'` 상태 추가(요청없음=pending과 실제진행중=analyzing을 구분, 전부 추가적 변경이라 기존 데이터 영향 없음)
+14. `0014_lemma_vocabulary.sql` — **신규 기능(단어장)**: `lemmas`/`lemma_usages`/`expression_analysis` 3개 테이블 + RLS + 인덱스 전부 새로 생성. 기존 테이블은 전혀 건드리지 않음(순수 추가)
 
 ## Edge Function 배포
 
@@ -195,6 +224,7 @@ Editor(또는 `supabase db push`)에서 직접 실행한다 — 자동으로 적
 supabase link --project-ref xwbcpanispdyrchddnzi
 supabase functions deploy analyze-expression
 supabase functions deploy analyze-batch
+supabase functions deploy analyze-lemma
 supabase secrets set OPENAI_API_KEY=sk-...   # 터미널에만 직접 입력. 채팅/코드에 쓰지 않기.
 ```
 
@@ -207,7 +237,7 @@ Switch)를 통과하기 전에는 실제 OpenAI 키를 연결하지 않는다.**
 
 ## 사용자가 직접 해야 하는 설정 (Claude Code가 대신 할 수 없는 작업)
 
-1. **Supabase 마이그레이션 적용**: 위 13개 SQL을 순서대로 SQL Editor에서 실행 (0012, 0013이 새로 추가됨, 아직 미실행이면 검토 후 적용)
+1. **Supabase 마이그레이션 적용**: 위 14개 SQL을 순서대로 SQL Editor에서 실행 (`0014`가 새로 추가됨, 아직 미실행이면 검토 후 적용)
 2. **Google OAuth**:
    - Google Cloud Console에서 OAuth 클라이언트 생성, 승인된 리디렉션 URI에
      `https://xwbcpanispdyrchddnzi.supabase.co/auth/v1/callback` 등록
@@ -221,8 +251,12 @@ Switch)를 통과하기 전에는 실제 OpenAI 키를 연결하지 않는다.**
      `VITE_SUPABASE_URL`, `VITE_SUPABASE_PUBLISHABLE_KEY` 등록
 5. **로컬 `.env.local`**: 위 환경 변수 표 참고
 6. **OpenAI API 키**: 보안 테스트 통과 후 `supabase secrets set OPENAI_API_KEY=...`
-7. **Edge Function 배포**: 위 "Edge Function 배포" 절 참고 (`analyze-expression`, `analyze-batch` 둘 다)
+7. **Edge Function 배포**: 위 "Edge Function 배포" 절 참고 (`analyze-expression`, `analyze-batch`, **신규 `analyze-lemma`** 전부)
 8. **최초 push**: `git push -u origin main` (원격 저장소가 비어있는 것을 확인했으므로 안전)
+9. **(선택) 백필**: 기존 표현들에 단어장 분석을 한꺼번에 채우려면 `.env.local`에
+   `SUPABASE_SERVICE_ROLE_KEY`/`OPENAI_API_KEY` 추가 후
+   `npm run backfill:analysis -- --dry-run`으로 개수 확인 → `npm run
+   backfill:analysis`로 실행
 
 ## 테스트 결과
 
@@ -230,7 +264,15 @@ Switch)를 통과하기 전에는 실제 OpenAI 키를 연결하지 않는다.**
 
 - `npm run typecheck` — 통과
 - `npm run build` — 통과 (더미 env로 로컬 빌드, 번들에 비밀키 누출 없음 확인)
-- `npm test` (`vitest`) — **88개 테스트 통과** (전부 모킹 기반, 실제 OpenAI/Supabase 네트워크 호출 없음)
+- `npm test` (`vitest`) — **107개 테스트 통과** (전부 모킹 기반, 실제 OpenAI/Supabase 네트워크 호출 없음)
+  - `lemmaMatching.test.ts` (14개): `analyze-lemma`가 실제로 쓰는
+    `supabase/functions/_shared/lemmaMatching.ts`를 그대로 import해서
+    테스트(별도 재구현 아님) — 캐시 히트→AI 호출 스킵, 존재하지 않는/
+    다른 lemma 소속 usage id는 거부, 같은 라벨 재사용, `usage_user_assigned`/
+    `label_user_edited` 보호, 스키마 실패 1회 재시도 후 중단
+  - `lemmaClient.test.ts` (5개, `supabase.functions.invoke` 모킹): 빈
+    배열이면 호출 안 함, force 플래그 전달, 20개 초과 시 자동 분할 호출,
+    에러/네트워크 예외 처리
   - `normalizeFr.test.ts` (3개)
   - `pasteParser.test.ts` (39개): 유저 예시 3줄 분리, 글머리 기호 9종,
     원형 숫자, 마크다운 굵게/코드/표, 구분자 8종, `peut-être`/`Qu'est-ce
@@ -240,9 +282,6 @@ Switch)를 통과하기 전에는 실제 OpenAI 키를 연결하지 않는다.**
     확인)**, 중복(정확 일치/악센트 다름/아포스트로피 통일/배치 내 반복/
     재붙여넣기) 전부 포함
   - `addExpression.test.ts` (5개): [+ 표현 추가] 입력이 fr/ko로 분리되는지, 출처 키워드→school 매핑
-  - `aiBatchClient.test.ts` (13개, `supabase.functions.invoke` 모킹): 청크 분할 경계값,
-    성공/서버 에러/개수 불일치/네트워크 예외 각각의 실패 처리, 청크 하나가
-    실패해도 나머지 청크는 계속 진행, 실패 청크만 모아내는 로직
   - `applyAnalysisResult.test.ts` (15개, `supabase.from`/`functions.invoke` 모킹):
     새 표현 분석 성공 시 DB 반영, 실패 시 `ai_analysis_status='failed'`만
     변경(원본 보존), 예문 신규삽입 vs 기존예문 업데이트(재분석 멱등성),
@@ -265,6 +304,11 @@ Switch)를 통과하기 전에는 실제 OpenAI 키를 연결하지 않는다.**
   **부분 검증됨** — 토큰 절단 수정(Phase 0)은 실제 로그로 성공 확인했으나,
   이번에 추가한 **상세 분석(`detailed: true`) 경로는 아직 실제 호출로
   검증 못함**. 아래 "실제 Supabase/OpenAI 연동 검증" 참고
+- **`analyze-lemma`(단어장) Edge Function은 전혀 호출된 적 없음** —
+  로그인 세션이 없어 제가 직접 호출할 방법이 없음(기존 제약과 동일).
+  코드 리뷰만 했고, Deno 런타임에서 실행해본 적도 없음(로컬에 Deno
+  CLI 없음, `supabase functions deploy`도 아직 안 함) — 실제 배포+호출
+  검증은 아래 "사용자가 할 일" 참고
 
 ### 수동 (사용자 환경에서만 가능 — 미검증)
 
@@ -283,6 +327,10 @@ Switch)를 통과하기 전에는 실제 OpenAI 키를 연결하지 않는다.**
 - PWA 설치, 오프라인 저장 → 재연결 시 동기화
 - `/ai-batch`: 실제 문장 여러 개 붙여넣기 → 1초 디바운스 자동 분석 → 결과
   카드 표시 → 저장 → 표현장/오늘복습 반영 (OpenAI 키 연결 후에만 가능)
+- **단어장**: `0014` 적용 + `analyze-lemma` 배포 후, mettre/baisser/monter가
+  들어간 문장 12개를 실제로 저장해서 `/vocabulary`에서 각 동사가 서로
+  다른 쓰임(놓다/두다, 옷입다, 기기켜다, se mettre à, mettre en place 등)으로
+  올바르게 나뉘는지 확인 (제가 로그인 세션이 없어 직접 확인 불가)
 
 ## 향후 개선 목록 (Phase 2 / 3, 지시서 §18 기준)
 

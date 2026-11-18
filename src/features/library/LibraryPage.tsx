@@ -207,6 +207,9 @@ export default function LibraryPage() {
       <div className="flex items-center justify-between">
         <h1 className="text-lg font-bold">표현장</h1>
         <div className="flex gap-2 text-xs">
+          <button onClick={() => navigate('/vocabulary')} className="rounded-full border border-slate-300 px-3 py-1 dark:border-slate-700">
+            📚 단어별 보기
+          </button>
           <button onClick={() => invalidate()} className="rounded-full border border-slate-300 px-3 py-1 dark:border-slate-700">
             상태 새로고침
           </button>
